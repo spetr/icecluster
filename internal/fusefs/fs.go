@@ -9,13 +9,13 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
+	"github.com/spetr/icecluster/internal/logsink"
 )
 
 type Apply interface {
@@ -154,10 +154,6 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	}
 	res := make([]fuse.Dirent, 0, len(entries))
 	for _, e := range entries {
-		// Hide internal temp files and common editor swap files from listings
-		if shouldHideName(e.Name()) {
-			continue
-		}
 		de := fuse.Dirent{Name: e.Name()}
 		if e.IsDir() {
 			de.Type = fuse.DT_Dir
@@ -206,28 +202,20 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 		}
 		log.Printf("fuse lock(create): path=%s acquired in %s", rp, time.Since(t0))
 	}
-	// Create a temp file in same directory; honor requested mode
+	// Create target directly (pass-through)
 	if err := os.MkdirAll(d.dir, 0755); err != nil {
 		return nil, nil, err
 	}
-	tmp, err := os.CreateTemp(d.dir, ".ice.local-*")
+	flags := int(req.Flags)
+	if flags&os.O_CREATE == 0 {
+		flags |= os.O_CREATE
+	}
+	fl, err := os.OpenFile(target, flags, req.Mode)
 	if err != nil {
 		return nil, nil, err
 	}
-	_ = os.Chmod(tmp.Name(), req.Mode)
-	// Create a zero-length file at target so Attr() on the node works before Release
-	if f0, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, req.Mode); err == nil {
-		_ = f0.Close()
-	}
-	fh := &FileHandle{
-		f:         &File{fs: d.fs, path: target},
-		fl:        tmp,
-		tmpPath:   tmp.Name(),
-		writeMode: true,
-	}
-	// track write-open on this path to handle unlink while open
-	d.fs.registerWrite(target, tmp)
-	// Return Node corresponding to the target path
+	fh := &FileHandle{f: &File{fs: d.fs, path: target}, fl: fl, writeMode: true}
+	d.fs.registerWrite(target, fl)
 	return fh.f, fh, nil
 }
 
@@ -364,29 +352,9 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 	if err != nil {
 		return err
 	}
-	size := fi.Size()
-	mtime := fi.ModTime()
-	// If a writer is open, prefer size/mtime from the temp handle to avoid showing empty file
-	f.fs.openMu.Lock()
-	st := f.fs.open[f.path]
-	var wfile *os.File
-	if st != nil && len(st.files) > 0 {
-		wfile = st.files[len(st.files)-1]
-	}
-	f.fs.openMu.Unlock()
-	if wfile != nil {
-		if wfi, err := wfile.Stat(); err == nil {
-			if wfi.Size() > size {
-				size = wfi.Size()
-			}
-			if wfi.ModTime().After(mtime) {
-				mtime = wfi.ModTime()
-			}
-		}
-	}
 	a.Mode = fi.Mode()
-	a.Size = uint64(size)
-	a.Mtime = mtime
+	a.Size = uint64(fi.Size())
+	a.Mtime = fi.ModTime()
 	if f.fs.Hooks != nil {
 		f.fs.Hooks.Fire(ctx, "stat", map[string]any{
 			"path":     relPath(f.fs.RootDir, f.path),
@@ -401,7 +369,7 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 
 func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
 	flags := int(req.Flags)
-	// open underlying file
+	// open underlying file directly (pass-through)
 	var fl *os.File
 	var err error
 	// acquire cluster lock on write opens
@@ -415,62 +383,21 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 		}
 		log.Printf("fuse lock: path=%s acquired in %s", rp, time.Since(t0))
 	}
-	var tmpPath string
+	// ensure directory exists for write opens
 	if writeMode {
-		// ensure directory exists
 		if err := os.MkdirAll(filepath.Dir(f.path), 0755); err != nil {
 			return nil, err
 		}
-		// create temp file in same dir
-		tmp, err := os.CreateTemp(filepath.Dir(f.path), ".ice.local-*")
-		if err != nil {
-			return nil, err
-		}
-		tmpPath = tmp.Name()
-		// if not truncation, pre-copy existing content to temp to preserve partial writes/appends
-		if flags&os.O_TRUNC == 0 {
-			if src, err := os.Open(f.path); err == nil {
-				_, _ = io.Copy(tmp, src)
-				_ = src.Close()
-			}
-		} else {
-			// explicit truncation requested; ensure temp is truncated to zero
-			if err := tmp.Truncate(0); err != nil {
-				_ = tmp.Close()
-				_ = os.Remove(tmpPath)
-				return nil, err
-			}
-			// also ensure target exists as empty so early attr/stat on target sees size 0
-			_ = os.WriteFile(f.path, []byte{}, 0644)
-		}
-		fl = tmp
-	} else {
-		// If there is an active writer with a temp handle, duplicate its FD for consistent reads
-		f.fs.openMu.Lock()
-		st := f.fs.open[f.path]
-		var wfile *os.File
-		if st != nil && len(st.files) > 0 {
-			wfile = st.files[len(st.files)-1]
-		}
-		f.fs.openMu.Unlock()
-		if wfile != nil {
-			dupFd, derr := syscall.Dup(int(wfile.Fd()))
-			if derr == nil {
-				fl = os.NewFile(uintptr(dupFd), f.path)
-			} else {
-				fl, err = os.Open(f.path)
-			}
-		} else {
-			fl, err = os.Open(f.path)
-		}
 	}
+	// open the actual path using requested flags; mode is ignored unless O_CREATE is used
+	fl, err = os.OpenFile(f.path, flags, 0644)
 	if err != nil {
 		return nil, err
 	}
 	if writeMode {
 		f.fs.registerWrite(f.path, fl)
 	}
-	return &FileHandle{f: f, fl: fl, tmpPath: tmpPath, writeMode: writeMode}, nil
+	return &FileHandle{f: f, fl: fl, tmpPath: "", writeMode: writeMode}, nil
 }
 
 type FileHandle struct {
@@ -509,56 +436,47 @@ func (h *FileHandle) Write(ctx context.Context, req *fuse.WriteRequest, resp *fu
 		return err
 	}
 	resp.Size = n
+	// verbose log each write chunk to avoid spamming default logs
+	logsink.Vprintf("fuse write: path=%s off=%d size=%d", relPath(h.f.fs.RootDir, h.f.path), req.Offset, n)
 	return nil
 }
 
 func (h *FileHandle) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
-	// propagate content to cluster on close if file was modified
+	// ensure content is flushed
 	if err := h.fl.Sync(); err != nil {
 		log.Printf("sync: %v", err)
 	}
+	// close handle
 	if err := h.fl.Close(); err != nil {
 		return err
 	}
-	// If this was a write handle, atomically replace the target file then replicate
-	if h.writeMode && h.tmpPath != "" {
+	// replicate the file if it still exists and this was a write handle
+	if h.writeMode {
 		// unregister write tracking; optionally honor delete-while-open
 		wasDeleted := h.f.fs.unregisterWrite(h.f.path, h.fl)
 		if wasDeleted && h.f.fs.AllowDeleteWhileLocked {
-			_ = os.Remove(h.tmpPath)
-			// skip finalize; file stays deleted per config
+			// skip replicate; file was deleted while open
 			goto after_unlock
 		}
-		// allow hook to block or rewrite the path before finalizing
+		// allow hook to block or rewrite the path before replication
 		target := h.f.path
 		if h.f.fs.Hooks != nil {
 			rp := relPath(h.f.fs.RootDir, target)
 			if allow, patch, reason := h.f.fs.Hooks.Decide(ctx, "file_put", map[string]any{"path": rp}); !allow {
 				log.Printf("hook deny file_put %s: %s", rp, reason)
-				_ = os.Remove(h.tmpPath)
 				// keep lock handling outside; Release will still unlock below
 				return fuse.EPERM
 			} else if v, ok := patch["path"].(string); ok && v != "" {
 				target = filepath.Join(h.f.fs.RootDir, v)
 			}
 		}
-		// ensure dir exists for target
-		if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
-			_ = os.Remove(h.tmpPath)
-			return err
-		}
-		// rename temp to final path (possibly patched)
-		if err := os.Rename(h.tmpPath, target); err != nil {
-			// attempt cleanup of temp on failure
-			_ = os.Remove(h.tmpPath)
-			return err
-		}
-		// open final to replicate
-		f, err := os.Open(target)
-		if err == nil {
-			defer f.Close()
-			if err := h.f.fs.Apply.ApplyPut(relPath(h.f.fs.RootDir, target), f); err != nil {
-				log.Printf("replicate put: %v", err)
+		if fi, err := os.Stat(target); err == nil {
+			log.Printf("fuse write commit: path=%s size=%d", relPath(h.f.fs.RootDir, target), fi.Size())
+			if f, err := os.Open(target); err == nil {
+				defer f.Close()
+				if err := h.f.fs.Apply.ApplyPut(relPath(h.f.fs.RootDir, target), f); err != nil {
+					log.Printf("replicate put: %v", err)
+				}
 			}
 		}
 	}
@@ -579,6 +497,7 @@ func (h *FileHandle) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
 		if err := h.fl.Sync(); err != nil {
 			return err
 		}
+		logsink.Vprintf("fuse fsync(handle): path=%s", relPath(h.f.fs.RootDir, h.f.path))
 	}
 	return nil
 }
@@ -589,51 +508,27 @@ func (h *FileHandle) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 		if err := h.fl.Sync(); err != nil {
 			return err
 		}
+		logsink.Vprintf("fuse flush: path=%s", relPath(h.f.fs.RootDir, h.f.path))
 	}
 	return nil
 }
 
 // Fsync is invoked to flush file data to disk while handle remains open.
 func (f *File) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
-	// If there's an open temp handle for this path, sync it; else sync the final path
-	f.fs.openMu.Lock()
-	st := f.fs.open[f.path]
-	var files []*os.File
-	if st != nil {
-		files = append(files, st.files...)
-	}
-	f.fs.openMu.Unlock()
-	if len(files) == 0 {
-		// sync the on-disk file if it exists
-		fl, err := os.Open(f.path)
-		if err != nil {
-			// if missing, nothing to sync
-			return nil
-		}
-		defer fl.Close()
-		if err := fl.Sync(); err != nil {
-			return err
-		}
-		if f.fs.Hooks != nil {
-			f.fs.Hooks.Fire(ctx, "file_sync", map[string]any{"path": relPath(f.fs.RootDir, f.path)})
-		}
+	// sync the on-disk file if it exists
+	fl, err := os.Open(f.path)
+	if err != nil {
+		// if missing, nothing to sync
 		return nil
 	}
-	var firstErr error
-	for _, fl := range files {
-		if fl == nil {
-			continue
-		}
-		if err := fl.Sync(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	if firstErr != nil {
-		return firstErr
+	defer fl.Close()
+	if err := fl.Sync(); err != nil {
+		return err
 	}
 	if f.fs.Hooks != nil {
 		f.fs.Hooks.Fire(ctx, "file_sync", map[string]any{"path": relPath(f.fs.RootDir, f.path)})
 	}
+	logsink.Vprintf("fuse fsync(node): path=%s", relPath(f.fs.RootDir, f.path))
 	return nil
 }
 
@@ -642,28 +537,9 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 	p := f.path
 	// Size (truncate)
 	if req.Valid.Size() {
-		// If there are open write handles for this path, truncate those temp files instead of the target
-		f.fs.openMu.Lock()
-		st := f.fs.open[p]
-		var files []*os.File
-		if st != nil {
-			files = append(files, st.files...)
-		}
-		f.fs.openMu.Unlock()
-		if len(files) > 0 {
-			for _, fl := range files {
-				if fl == nil {
-					continue
-				}
-				if err := fl.Truncate(int64(req.Size)); err != nil {
-					return err
-				}
-			}
-		} else {
-			// No active writer; apply truncate to the actual path
-			if err := os.Truncate(p, int64(req.Size)); err != nil {
-				return err
-			}
+		// Apply truncate directly to the actual path
+		if err := os.Truncate(p, int64(req.Size)); err != nil {
+			return err
 		}
 		if f.fs.Hooks != nil {
 			f.fs.Hooks.Fire(ctx, "attr_change", map[string]any{"path": relPath(f.fs.RootDir, p), "size": int64(req.Size), "kind": "file"})
@@ -770,8 +646,6 @@ func MountAndServe(ctx context.Context, mountpoint, root string, applier Apply, 
 	mountedFSMu.Lock()
 	mountedFS = fsys
 	mountedFSMu.Unlock()
-	// Cleanup any stale temp files from previous crashes in the backing store
-	cleanStaleTemps(root)
 	return fs.Serve(c, fsys)
 }
 
@@ -824,39 +698,17 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 			p = filepath.Join(d.fs.RootDir, v)
 		}
 	}
+	log.Printf("fuse delete: path=%s", relPath(d.fs.RootDir, p))
 	if err := os.Remove(p); err != nil {
 		return err
 	}
 	// Mark as deleted in case it was removed while still open to prevent finalize on Release
 	d.fs.markDeleted(p)
 	// replicate delete
-	return d.fs.Apply.ApplyDelete(relPath(d.fs.RootDir, p))
-}
-
-// cleanStaleTemps removes leftover temp files created by this FUSE layer (e.g., .ice.local-*)
-func cleanStaleTemps(root string) {
-	removed := 0
-	_ = filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
-		if err != nil || info == nil || info.IsDir() {
-			return nil
-		}
-		base := filepath.Base(p)
-		if strings.HasPrefix(base, ".ice.local-") {
-			if err := os.Remove(p); err == nil {
-				removed++
-			}
-		}
-		return nil
-	})
-	if removed > 0 {
-		log.Printf("fuse: cleaned %d stale temp file(s)", removed)
+	if err := d.fs.Apply.ApplyDelete(relPath(d.fs.RootDir, p)); err != nil {
+		log.Printf("replicate delete failed: path=%s err=%v", relPath(d.fs.RootDir, p), err)
+		return err
 	}
-}
-
-// shouldHideName determines whether a directory entry should be hidden from listing
-func shouldHideName(name string) bool {
-	if strings.HasPrefix(name, ".ice.local-") {
-		return true
-	}
-	return false
+	log.Printf("fuse delete replicated: path=%s", relPath(d.fs.RootDir, p))
+	return nil
 }
