@@ -131,6 +131,10 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 		return nil, nil, err
 	}
 	_ = os.Chmod(tmp.Name(), req.Mode)
+	// Create a zero-length file at target so Attr() on the node works before Release
+	if f0, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, req.Mode); err == nil {
+		_ = f0.Close()
+	}
 	fh := &FileHandle{
 		f:         &File{fs: d.fs, path: target},
 		fl:        tmp,
