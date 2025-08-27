@@ -7,6 +7,9 @@ on:
   release:
     types: [published]
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Release Build (linux/${{ matrix.arch }}, Go ${{ matrix.go-version }})
@@ -83,5 +86,6 @@ jobs:
         if: github.event_name == 'release' && github.event.action == 'published'
         uses: softprops/action-gh-release@v2
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
           files: |
             dist/icecluster-${VERSION}-linux-${{ matrix.arch }}.tar.gz
