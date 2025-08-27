@@ -19,10 +19,15 @@ func Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := strings.TrimPrefix(r.URL.Path, "/ui")
 		if p == "" || p == "/" {
-			// Serve index.html via file server by rewriting path
-			r2 := r.Clone(r.Context())
-			r2.URL.Path = "/index.html"
-			fileServer.ServeHTTP(w, r2)
+			// Serve index.html directly to avoid FileServer redirecting to "./"
+			data, err := fs.ReadFile(sub, "index.html")
+			if err != nil {
+				http.Error(w, "index not found", http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(data)
 			return
 		}
 		// Normalize and ensure no path escape

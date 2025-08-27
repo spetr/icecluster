@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -74,6 +75,10 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	}
 	res := make([]fuse.Dirent, 0, len(entries))
 	for _, e := range entries {
+		// Hide internal temp files from listings
+		if strings.HasPrefix(e.Name(), ".ice.local-") {
+			continue
+		}
 		de := fuse.Dirent{Name: e.Name()}
 		if e.IsDir() {
 			de.Type = fuse.DT_Dir
@@ -526,6 +531,8 @@ func MountAndServe(ctx context.Context, mountpoint, root string, applier Apply, 
 	}()
 
 	fsys := &FS{RootDir: root, Apply: applier, Locker: locker, Hooks: hooks}
+	// Cleanup any stale temp files from previous crashes in the backing store
+	cleanStaleTemps(root)
 	return fs.Serve(c, fsys)
 }
 
@@ -577,4 +584,24 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 
 func isENOSYS(err error) bool {
 	return err == syscall.ENOSYS
+}
+
+// cleanStaleTemps removes leftover temp files created by this FUSE layer (e.g., .ice.local-*)
+func cleanStaleTemps(root string) {
+	removed := 0
+	_ = filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		base := filepath.Base(p)
+		if strings.HasPrefix(base, ".ice.local-") {
+			if err := os.Remove(p); err == nil {
+				removed++
+			}
+		}
+		return nil
+	})
+	if removed > 0 {
+		log.Printf("fuse: cleaned %d stale temp file(s)", removed)
+	}
 }
