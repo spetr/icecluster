@@ -35,7 +35,6 @@ type FS struct {
 	openMu sync.Mutex
 	open   map[string]*openState
 	// If true, honoring delete while open means skipping finalize on close
-	AllowDeleteWhileLocked bool
 }
 
 type openState struct {
@@ -46,11 +45,6 @@ type openState struct {
 
 func (f *FS) Root() (fs.Node, error) {
 	return &Dir{fs: f, dir: f.RootDir}, nil
-}
-
-// WithOptions applies runtime options to the filesystem instance
-func (f *FS) WithOptions(allowDeleteWhileLocked bool) {
-	f.AllowDeleteWhileLocked = allowDeleteWhileLocked
 }
 
 // registerWrite increments refcount for a path being written
@@ -100,21 +94,6 @@ func (f *FS) unregisterWrite(path string, fl *os.File) (wasDeleted bool) {
 	return
 }
 
-// markDeleted marks a path as deleted while open
-func (f *FS) markDeleted(path string) {
-	if f == nil {
-		return
-	}
-	f.openMu.Lock()
-	defer f.openMu.Unlock()
-	if f.open == nil {
-		return
-	}
-	if st, ok := f.open[path]; ok {
-		st.deleted = true
-	}
-}
-
 type Dir struct {
 	fs  *FS
 	dir string
@@ -162,6 +141,8 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 		}
 		res = append(res, de)
 	}
+	// verbose: directory listing
+	logsink.Vprintf("fuse readdir: path=%s entries=%d", relPath(d.fs.RootDir, d.dir), len(res))
 	if d.fs.Hooks != nil {
 		if allow, _, _ := d.fs.Hooks.Decide(ctx, "dir_list", map[string]any{"path": relPath(d.fs.RootDir, d.dir)}); !allow {
 			return nil, fuse.EPERM
@@ -175,8 +156,11 @@ func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	p := filepath.Join(d.dir, name)
 	fi, err := os.Stat(p)
 	if err != nil {
+		// verbose: not found
+		logsink.Vprintf("fuse lookup: path=%s notfound", relPath(d.fs.RootDir, p))
 		return nil, fuse.ENOENT
 	}
+	logsink.Vprintf("fuse lookup: path=%s", relPath(d.fs.RootDir, p))
 	if fi.IsDir() {
 		return &Dir{fs: d.fs, dir: p}, nil
 	}
@@ -214,6 +198,7 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 	if err != nil {
 		return nil, nil, err
 	}
+	log.Printf("fuse create: path=%s mode=%#o flags=%d", relPath(d.fs.RootDir, target), uint32(req.Mode), int(req.Flags))
 	fh := &FileHandle{f: &File{fs: d.fs, path: target}, fl: fl, writeMode: true}
 	d.fs.registerWrite(target, fl)
 	return fh.f, fh, nil
@@ -233,6 +218,7 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 	if err := os.MkdirAll(p, req.Mode); err != nil {
 		return nil, err
 	}
+	log.Printf("fuse mkdir: path=%s mode=%#o", relPath(d.fs.RootDir, p), uint32(req.Mode))
 	if d.fs.Hooks != nil {
 		d.fs.Hooks.Fire(ctx, "dir_create", map[string]any{"path": relPath(d.fs.RootDir, p)})
 	}
@@ -263,6 +249,7 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Nod
 	if err := os.Rename(oldPath, newPath); err != nil {
 		return err
 	}
+	log.Printf("fuse rename: old=%s new=%s", relPath(d.fs.RootDir, oldPath), relPath(d.fs.RootDir, newPath))
 	if d.fs.Hooks != nil {
 		// Determine whether it's a dir or file post-rename
 		isDir := false
@@ -295,6 +282,7 @@ func (d *Dir) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.
 		if err := os.Chown(p, uid, gid); err != nil {
 			return err
 		}
+		logsink.Vprintf("fuse setattr(dir:owner): path=%s uid=%d gid=%d", relPath(d.fs.RootDir, p), uid, gid)
 		if d.fs.Hooks != nil {
 			d.fs.Hooks.Fire(ctx, "owner_change", map[string]any{"path": relPath(d.fs.RootDir, p), "uid": int(req.Uid), "gid": int(req.Gid), "kind": "dir"})
 		}
@@ -304,6 +292,7 @@ func (d *Dir) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.
 		if err := os.Chmod(p, req.Mode); err != nil {
 			return err
 		}
+		logsink.Vprintf("fuse setattr(dir:mode): path=%s mode=%#o", relPath(d.fs.RootDir, p), uint32(req.Mode))
 		if d.fs.Hooks != nil {
 			d.fs.Hooks.Fire(ctx, "attr_change", map[string]any{"path": relPath(d.fs.RootDir, p), "mode": uint32(req.Mode), "kind": "dir"})
 		}
@@ -321,6 +310,7 @@ func (d *Dir) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.
 		if err := os.Chtimes(p, at, mt); err != nil {
 			return err
 		}
+		logsink.Vprintf("fuse setattr(dir:times): path=%s atime=%d mtime=%d", relPath(d.fs.RootDir, p), at.UnixNano(), mt.UnixNano())
 		if d.fs.Hooks != nil {
 			d.fs.Hooks.Fire(ctx, "attr_change", map[string]any{"path": relPath(d.fs.RootDir, p), "atime_ns": at.UnixNano(), "mtime_ns": mt.UnixNano(), "kind": "dir"})
 		}
@@ -394,6 +384,7 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 	if err != nil {
 		return nil, err
 	}
+	logsink.Vprintf("fuse open: path=%s flags=%d write=%t", relPath(f.fs.RootDir, f.path), flags, writeMode)
 	if writeMode {
 		f.fs.registerWrite(f.path, fl)
 	}
@@ -454,7 +445,7 @@ func (h *FileHandle) Release(ctx context.Context, req *fuse.ReleaseRequest) erro
 	if h.writeMode {
 		// unregister write tracking; optionally honor delete-while-open
 		wasDeleted := h.f.fs.unregisterWrite(h.f.path, h.fl)
-		if wasDeleted && h.f.fs.AllowDeleteWhileLocked {
+		if wasDeleted {
 			// skip replicate; file was deleted while open
 			goto after_unlock
 		}
@@ -541,6 +532,7 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 		if err := os.Truncate(p, int64(req.Size)); err != nil {
 			return err
 		}
+		logsink.Vprintf("fuse setattr(file:size): path=%s size=%d", relPath(f.fs.RootDir, p), int64(req.Size))
 		if f.fs.Hooks != nil {
 			f.fs.Hooks.Fire(ctx, "attr_change", map[string]any{"path": relPath(f.fs.RootDir, p), "size": int64(req.Size), "kind": "file"})
 		}
@@ -558,6 +550,7 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 		if err := os.Chown(p, uid, gid); err != nil {
 			return err
 		}
+		logsink.Vprintf("fuse setattr(file:owner): path=%s uid=%d gid=%d", relPath(f.fs.RootDir, p), uid, gid)
 		if f.fs.Hooks != nil {
 			f.fs.Hooks.Fire(ctx, "owner_change", map[string]any{"path": relPath(f.fs.RootDir, p), "uid": int(req.Uid), "gid": int(req.Gid), "kind": "file"})
 		}
@@ -567,6 +560,7 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 		if err := os.Chmod(p, req.Mode); err != nil {
 			return err
 		}
+		logsink.Vprintf("fuse setattr(file:mode): path=%s mode=%#o", relPath(f.fs.RootDir, p), uint32(req.Mode))
 		if f.fs.Hooks != nil {
 			f.fs.Hooks.Fire(ctx, "attr_change", map[string]any{"path": relPath(f.fs.RootDir, p), "mode": uint32(req.Mode), "kind": "file"})
 		}
@@ -584,6 +578,7 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 		if err := os.Chtimes(p, at, mt); err != nil {
 			return err
 		}
+		logsink.Vprintf("fuse setattr(file:times): path=%s atime=%d mtime=%d", relPath(f.fs.RootDir, p), at.UnixNano(), mt.UnixNano())
 		if f.fs.Hooks != nil {
 			f.fs.Hooks.Fire(ctx, "attr_change", map[string]any{"path": relPath(f.fs.RootDir, p), "atime_ns": at.UnixNano(), "mtime_ns": mt.UnixNano(), "kind": "file"})
 		}
@@ -605,10 +600,6 @@ func relPath(root, p string) string {
 	return r
 }
 
-type Options struct {
-	AllowDeleteWhileLocked bool
-}
-
 // keep a reference to the mounted FS to allow runtime option updates (e.g., on SIGHUP)
 var mountedFSMu sync.Mutex
 var mountedFS *FS
@@ -616,7 +607,7 @@ var mountedFS *FS
 func MountAndServe(ctx context.Context, mountpoint, root string, applier Apply, locker Locker, hooks interface {
 	Fire(ctx context.Context, event string, payload map[string]any)
 	Decide(ctx context.Context, event string, payload map[string]any) (bool, map[string]any, string)
-}, opts ...Options) error {
+}) error {
 	// Attempt to mount; if it fails (possibly due to stale mount), unmount and retry once.
 	c, err := fuse.Mount(mountpoint, fuse.FSName("icecluster"), fuse.Subtype("ice"))
 	if err != nil {
@@ -633,6 +624,9 @@ func MountAndServe(ctx context.Context, mountpoint, root string, applier Apply, 
 		c.Close()
 	}()
 
+	// Log successful FUSE mount
+	log.Printf("fuse mounted: mountpoint=%s backing=%s", mountpoint, root)
+
 	// On context cancellation, request unmount so the next start doesn't require manual fusermount3 -u
 	go func() {
 		<-ctx.Done()
@@ -640,9 +634,6 @@ func MountAndServe(ctx context.Context, mountpoint, root string, applier Apply, 
 	}()
 
 	fsys := &FS{RootDir: root, Apply: applier, Locker: locker, Hooks: hooks}
-	if len(opts) > 0 {
-		fsys.AllowDeleteWhileLocked = opts[0].AllowDeleteWhileLocked
-	}
 	mountedFSMu.Lock()
 	mountedFS = fsys
 	mountedFSMu.Unlock()
@@ -652,16 +643,6 @@ func MountAndServe(ctx context.Context, mountpoint, root string, applier Apply, 
 // Unmount requests unmount of the given mountpoint (Linux build).
 func Unmount(mountpoint string) error {
 	return fuse.Unmount(mountpoint)
-}
-
-// UpdateOptions applies runtime options to the currently mounted filesystem instance.
-// No-op if the filesystem isn't mounted on this process.
-func UpdateOptions(o Options) {
-	mountedFSMu.Lock()
-	defer mountedFSMu.Unlock()
-	if mountedFS != nil {
-		mountedFS.WithOptions(o.AllowDeleteWhileLocked)
-	}
 }
 
 // FS implements removal via Dir.Remove
@@ -684,6 +665,7 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 			}
 			return err
 		}
+		log.Printf("fuse rmdir: path=%s", relPath(d.fs.RootDir, p))
 		if d.fs.Hooks != nil {
 			d.fs.Hooks.Fire(ctx, "dir_delete", map[string]any{"path": relPath(d.fs.RootDir, p)})
 		}
@@ -702,8 +684,6 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	if err := os.Remove(p); err != nil {
 		return err
 	}
-	// Mark as deleted in case it was removed while still open to prevent finalize on Release
-	d.fs.markDeleted(p)
 	// replicate delete
 	if err := d.fs.Apply.ApplyDelete(relPath(d.fs.RootDir, p)); err != nil {
 		log.Printf("replicate delete failed: path=%s err=%v", relPath(d.fs.RootDir, p), err)

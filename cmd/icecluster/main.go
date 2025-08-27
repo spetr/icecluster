@@ -176,8 +176,6 @@ func main() {
 						}
 						// save new config
 						cfg = newCfg
-						// apply FUSE runtime options, if mounted
-						fusefs.UpdateOptions(fusefs.Options{AllowDeleteWhileLocked: cfg.AllowDeleteWhileLocked})
 					}
 				}
 			}
@@ -198,7 +196,7 @@ func main() {
 	}()
 
 	go func() {
-		if err := fusefs.MountAndServe(ctx, cfg.Mount, cfg.Backing, repl, lockClient, hookEng, fusefs.Options{AllowDeleteWhileLocked: cfg.AllowDeleteWhileLocked}); err != nil {
+		if err := fusefs.MountAndServe(ctx, cfg.Mount, cfg.Backing, repl, lockClient, hookEng); err != nil {
 			log.Printf("fuse: %v", err)
 			cancel()
 		}

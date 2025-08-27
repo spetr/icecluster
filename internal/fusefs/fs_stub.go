@@ -20,7 +20,6 @@ type Locker interface {
 }
 
 type Options struct {
-	AllowDeleteWhileLocked bool
 }
 
 func MountAndServe(ctx context.Context, mountpoint, root string, applier Apply, locker Locker, hooks interface {

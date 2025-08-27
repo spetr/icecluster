@@ -37,8 +37,6 @@ type Config struct {
 	HooksTimeout time.Duration `yaml:"hooks_timeout"`
 	// HooksLogFile: when set, Lua hooks log to this separate file; otherwise default logging is used
 	HooksLogFile string `yaml:"hooks_log_file"`
-	// If true, deleting a file while a writer holds a lock/open handle will not recreate it on close
-	AllowDeleteWhileLocked bool `yaml:"allow_delete_while_locked"`
 	// SourcePath is the path of the loaded YAML file (not serialized)
 	SourcePath string `yaml:"-"`
 }
@@ -65,31 +63,30 @@ func defaultConfig() *Config {
 		host = "node"
 	}
 	return &Config{
-		NodeID:                 host,
-		BindAddr:               ":9000",
-		Join:                   "",
-		DataDir:                "/var/lib/icecluster",
-		Backing:                "/opt/icewarp/config-local",
-		Mount:                  "/opt/icewarp/config",
-		Keepalive:              time.Minute,
-		ClockSkewMax:           time.Second,
-		SyncMode:               "latest",
-		KeepaliveFailures:      1,
-		ConsistencyInterval:    0,
-		ConsistencyMode:        "report",
-		LockTimeout:            5 * time.Second,
-		LockRetry:              300 * time.Millisecond,
-		LogFile:                "",
-		LogVerbose:             false,
-		ReadyRequireSync:       true,
-		ReadyRequirePeer:       false,
-		APIToken:               "",
-		TLSCert:                "",
-		TLSKey:                 "",
-		HooksDir:               "",
-		HooksTimeout:           2 * time.Second,
-		HooksLogFile:           "",
-		AllowDeleteWhileLocked: true,
+		NodeID:              host,
+		BindAddr:            ":9000",
+		Join:                "",
+		DataDir:             "/var/lib/icecluster",
+		Backing:             "/opt/icewarp/config-local",
+		Mount:               "/opt/icewarp/config",
+		Keepalive:           time.Minute,
+		ClockSkewMax:        time.Second,
+		SyncMode:            "latest",
+		KeepaliveFailures:   1,
+		ConsistencyInterval: 0,
+		ConsistencyMode:     "report",
+		LockTimeout:         5 * time.Second,
+		LockRetry:           300 * time.Millisecond,
+		LogFile:             "",
+		LogVerbose:          false,
+		ReadyRequireSync:    true,
+		ReadyRequirePeer:    false,
+		APIToken:            "",
+		TLSCert:             "",
+		TLSKey:              "",
+		HooksDir:            "",
+		HooksTimeout:        2 * time.Second,
+		HooksLogFile:        "",
 	}
 }
 
