@@ -648,6 +648,7 @@ func Unmount(mountpoint string) error {
 // FS implements removal via Dir.Remove
 func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	p := filepath.Join(d.dir, req.Name)
+	log.Printf("fuse delete: path=%s", relPath(d.fs.RootDir, p))
 	if req.Dir {
 		if d.fs.Hooks != nil {
 			if allow, patch, reason := d.fs.Hooks.Decide(ctx, "dir_delete", map[string]any{"path": relPath(d.fs.RootDir, p)}); !allow {
@@ -680,7 +681,6 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 			p = filepath.Join(d.fs.RootDir, v)
 		}
 	}
-	log.Printf("fuse delete: path=%s", relPath(d.fs.RootDir, p))
 	if err := os.Remove(p); err != nil {
 		return err
 	}
