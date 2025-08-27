@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -30,10 +31,68 @@ type FS struct {
 		Fire(ctx context.Context, event string, payload map[string]any)
 		Decide(ctx context.Context, event string, payload map[string]any) (bool, map[string]any, string)
 	}
+	// track open write handles to handle unlink-while-open (e.g., vim swap files)
+	openMu sync.Mutex
+	open   map[string]*openState
+}
+
+type openState struct {
+	ref     int
+	deleted bool
 }
 
 func (f *FS) Root() (fs.Node, error) {
 	return &Dir{fs: f, dir: f.RootDir}, nil
+}
+
+// registerWrite increments refcount for a path being written
+func (f *FS) registerWrite(path string) {
+	if f == nil {
+		return
+	}
+	f.openMu.Lock()
+	defer f.openMu.Unlock()
+	if f.open == nil {
+		f.open = make(map[string]*openState)
+	}
+	st, ok := f.open[path]
+	if !ok {
+		st = &openState{}
+		f.open[path] = st
+	}
+	st.ref++
+}
+
+// unregisterWrite decrements refcount and clears state if zero; returns whether path was marked deleted
+func (f *FS) unregisterWrite(path string) (wasDeleted bool) {
+	if f == nil {
+		return false
+	}
+	f.openMu.Lock()
+	defer f.openMu.Unlock()
+	if st, ok := f.open[path]; ok {
+		wasDeleted = st.deleted
+		st.ref--
+		if st.ref <= 0 {
+			delete(f.open, path)
+		}
+	}
+	return
+}
+
+// markDeleted marks a path as deleted while open
+func (f *FS) markDeleted(path string) {
+	if f == nil {
+		return
+	}
+	f.openMu.Lock()
+	defer f.openMu.Unlock()
+	if f.open == nil {
+		return
+	}
+	if st, ok := f.open[path]; ok {
+		st.deleted = true
+	}
 }
 
 type Dir struct {
@@ -75,8 +134,8 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	}
 	res := make([]fuse.Dirent, 0, len(entries))
 	for _, e := range entries {
-		// Hide internal temp files from listings
-		if strings.HasPrefix(e.Name(), ".ice.local-") {
+		// Hide internal temp files and common editor swap files from listings
+		if shouldHideName(e.Name()) {
 			continue
 		}
 		de := fuse.Dirent{Name: e.Name()}
@@ -146,6 +205,8 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 		tmpPath:   tmp.Name(),
 		writeMode: true,
 	}
+	// track write-open on this path to handle unlink while open
+	d.fs.registerWrite(target)
 	// Return Node corresponding to the target path
 	return fh.f, fh, nil
 }
@@ -340,6 +401,9 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 	if err != nil {
 		return nil, err
 	}
+	if writeMode {
+		f.fs.registerWrite(f.path)
+	}
 	return &FileHandle{f: f, fl: fl, tmpPath: tmpPath, writeMode: writeMode}, nil
 }
 
@@ -390,6 +454,12 @@ func (h *FileHandle) Release(ctx context.Context, req *fuse.ReleaseRequest) erro
 	}
 	// If this was a write handle, atomically replace the target file then replicate
 	if h.writeMode && h.tmpPath != "" {
+		// check if the file was unlinked while open; if so, skip finalizing
+		wasDeleted := h.f.fs.unregisterWrite(h.f.path)
+		if wasDeleted {
+			_ = os.Remove(h.tmpPath)
+			goto unlock
+		}
 		// allow hook to block or rewrite the path before finalizing
 		target := h.f.path
 		if h.f.fs.Hooks != nil {
@@ -423,6 +493,7 @@ func (h *FileHandle) Release(ctx context.Context, req *fuse.ReleaseRequest) erro
 			}
 		}
 	}
+unlock:
 	if h.f.fs.Locker != nil {
 		rp := relPath(h.f.fs.RootDir, h.f.path)
 		t0 := time.Now()
@@ -578,12 +649,10 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	if err := os.Remove(p); err != nil {
 		return err
 	}
+	// Mark as deleted in case it was removed while still open to prevent finalize on Release
+	d.fs.markDeleted(p)
 	// replicate delete
 	return d.fs.Apply.ApplyDelete(relPath(d.fs.RootDir, p))
-}
-
-func isENOSYS(err error) bool {
-	return err == syscall.ENOSYS
 }
 
 // cleanStaleTemps removes leftover temp files created by this FUSE layer (e.g., .ice.local-*)
@@ -604,4 +673,12 @@ func cleanStaleTemps(root string) {
 	if removed > 0 {
 		log.Printf("fuse: cleaned %d stale temp file(s)", removed)
 	}
+}
+
+// shouldHideName determines whether a directory entry should be hidden from listing
+func shouldHideName(name string) bool {
+	if strings.HasPrefix(name, ".ice.local-") {
+		return true
+	}
+	return false
 }
