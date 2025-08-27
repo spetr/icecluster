@@ -94,6 +94,21 @@ func (f *FS) unregisterWrite(path string, fl *os.File) (wasDeleted bool) {
 	return
 }
 
+// markDeleted marks a path as deleted while it may still have open handles
+func (f *FS) markDeleted(path string) {
+	if f == nil {
+		return
+	}
+	f.openMu.Lock()
+	defer f.openMu.Unlock()
+	if f.open == nil {
+		return
+	}
+	if st, ok := f.open[path]; ok {
+		st.deleted = true
+	}
+}
+
 type Dir struct {
 	fs  *FS
 	dir string
@@ -229,7 +244,7 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Node) error {
 	nd, ok := newDir.(*Dir)
 	if !ok {
-		return fuse.EIO
+		return syscall.Errno(syscall.EIO)
 	}
 	oldPath := filepath.Join(d.dir, req.OldName)
 	newPath := filepath.Join(nd.dir, req.NewName)
@@ -648,7 +663,7 @@ func Unmount(mountpoint string) error {
 // FS implements removal via Dir.Remove
 func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	p := filepath.Join(d.dir, req.Name)
-	log.Printf("fuse delete: path=%s", relPath(d.fs.RootDir, p))
+	log.Printf("fuse delete: path=%s", relPath(d.fs.RootDir, req.Name))
 	if req.Dir {
 		if d.fs.Hooks != nil {
 			if allow, patch, reason := d.fs.Hooks.Decide(ctx, "dir_delete", map[string]any{"path": relPath(d.fs.RootDir, p)}); !allow {
@@ -684,6 +699,8 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	if err := os.Remove(p); err != nil {
 		return err
 	}
+	// mark as deleted while potential writers may still have the file open
+	d.fs.markDeleted(p)
 	// replicate delete
 	if err := d.fs.Apply.ApplyDelete(relPath(d.fs.RootDir, p)); err != nil {
 		log.Printf("replicate delete failed: path=%s err=%v", relPath(d.fs.RootDir, p), err)
