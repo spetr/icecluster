@@ -478,12 +478,9 @@ func (h *FileHandle) Release(ctx context.Context, req *fuse.ReleaseRequest) erro
 	}
 	// If this was a write handle, atomically replace the target file then replicate
 	if h.writeMode && h.tmpPath != "" {
-		// check if the file was unlinked while open; if so, skip finalizing
-		wasDeleted := h.f.fs.unregisterWrite(h.f.path, h.fl)
-		if wasDeleted {
-			_ = os.Remove(h.tmpPath)
-			goto unlock
-		}
+		// unregister write tracking; proceed to finalize even if target was unlinked
+		// Editors (e.g., vim) often unlink before rename as part of atomic save.
+		_ = h.f.fs.unregisterWrite(h.f.path, h.fl)
 		// allow hook to block or rewrite the path before finalizing
 		target := h.f.path
 		if h.f.fs.Hooks != nil {
@@ -517,7 +514,6 @@ func (h *FileHandle) Release(ctx context.Context, req *fuse.ReleaseRequest) erro
 			}
 		}
 	}
-unlock:
 	if h.f.fs.Locker != nil {
 		rp := relPath(h.f.fs.RootDir, h.f.path)
 		t0 := time.Now()
