@@ -357,9 +357,29 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 	if err != nil {
 		return err
 	}
+	size := fi.Size()
+	mtime := fi.ModTime()
+	// If a writer is open, prefer size/mtime from the temp handle to avoid showing empty file
+	f.fs.openMu.Lock()
+	st := f.fs.open[f.path]
+	var wfile *os.File
+	if st != nil && len(st.files) > 0 {
+		wfile = st.files[len(st.files)-1]
+	}
+	f.fs.openMu.Unlock()
+	if wfile != nil {
+		if wfi, err := wfile.Stat(); err == nil {
+			if wfi.Size() > size {
+				size = wfi.Size()
+			}
+			if wfi.ModTime().After(mtime) {
+				mtime = wfi.ModTime()
+			}
+		}
+	}
 	a.Mode = fi.Mode()
-	a.Size = uint64(fi.Size())
-	a.Mtime = fi.ModTime()
+	a.Size = uint64(size)
+	a.Mtime = mtime
 	if f.fs.Hooks != nil {
 		f.fs.Hooks.Fire(ctx, "stat", map[string]any{
 			"path":     relPath(f.fs.RootDir, f.path),
@@ -418,7 +438,24 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 		}
 		fl = tmp
 	} else {
-		fl, err = os.Open(f.path)
+		// If there is an active writer with a temp handle, duplicate its FD for consistent reads
+		f.fs.openMu.Lock()
+		st := f.fs.open[f.path]
+		var wfile *os.File
+		if st != nil && len(st.files) > 0 {
+			wfile = st.files[len(st.files)-1]
+		}
+		f.fs.openMu.Unlock()
+		if wfile != nil {
+			dupFd, derr := syscall.Dup(int(wfile.Fd()))
+			if derr == nil {
+				fl = os.NewFile(uintptr(dupFd), f.path)
+			} else {
+				fl, err = os.Open(f.path)
+			}
+		} else {
+			fl, err = os.Open(f.path)
+		}
 	}
 	if err != nil {
 		return nil, err
