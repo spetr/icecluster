@@ -46,6 +46,7 @@ var _ fs.NodeStringLookuper = (*Dir)(nil)
 var _ fs.NodeMkdirer = (*Dir)(nil)
 var _ fs.NodeRenamer = (*Dir)(nil)
 var _ fs.NodeSetattrer = (*Dir)(nil)
+var _ fs.NodeCreater = (*Dir)(nil)
 
 func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
 	fi, err := os.Stat(d.dir)
@@ -100,6 +101,44 @@ func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 		return &Dir{fs: d.fs, dir: p}, nil
 	}
 	return &File{fs: d.fs, path: p}, nil
+}
+
+// Create handles O_CREAT for files under this directory.
+func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (fs.Node, fs.Handle, error) {
+	target := filepath.Join(d.dir, req.Name)
+	// O_EXCL: if target exists, fail
+	if int(req.Flags)&os.O_EXCL != 0 {
+		if _, err := os.Stat(target); err == nil {
+			return nil, nil, fuse.Errno(syscall.EEXIST)
+		}
+	}
+	// Acquire cluster lock before writes, similar to File.Open
+	if d.fs.Locker != nil {
+		rp := relPath(d.fs.RootDir, target)
+		t0 := time.Now()
+		if err := d.fs.Locker.Lock(rp); err != nil {
+			log.Printf("fuse lock(create): path=%s failed after %s: %v", rp, time.Since(t0), err)
+			return nil, nil, err
+		}
+		log.Printf("fuse lock(create): path=%s acquired in %s", rp, time.Since(t0))
+	}
+	// Create a temp file in same directory; honor requested mode
+	if err := os.MkdirAll(d.dir, 0755); err != nil {
+		return nil, nil, err
+	}
+	tmp, err := os.CreateTemp(d.dir, ".ice.local-*")
+	if err != nil {
+		return nil, nil, err
+	}
+	_ = os.Chmod(tmp.Name(), req.Mode)
+	fh := &FileHandle{
+		f:         &File{fs: d.fs, path: target},
+		fl:        tmp,
+		tmpPath:   tmp.Name(),
+		writeMode: true,
+	}
+	// Return Node corresponding to the target path
+	return fh.f, fh, nil
 }
 
 func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error) {
