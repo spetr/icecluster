@@ -406,6 +406,15 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 				_, _ = io.Copy(tmp, src)
 				_ = src.Close()
 			}
+		} else {
+			// explicit truncation requested; ensure temp is truncated to zero
+			if err := tmp.Truncate(0); err != nil {
+				_ = tmp.Close()
+				_ = os.Remove(tmpPath)
+				return nil, err
+			}
+			// also ensure target exists as empty so early attr/stat on target sees size 0
+			_ = os.WriteFile(f.path, []byte{}, 0644)
 		}
 		fl = tmp
 	} else {
@@ -588,8 +597,28 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 	p := f.path
 	// Size (truncate)
 	if req.Valid.Size() {
-		if err := os.Truncate(p, int64(req.Size)); err != nil {
-			return err
+		// If there are open write handles for this path, truncate those temp files instead of the target
+		f.fs.openMu.Lock()
+		st := f.fs.open[p]
+		var files []*os.File
+		if st != nil {
+			files = append(files, st.files...)
+		}
+		f.fs.openMu.Unlock()
+		if len(files) > 0 {
+			for _, fl := range files {
+				if fl == nil {
+					continue
+				}
+				if err := fl.Truncate(int64(req.Size)); err != nil {
+					return err
+				}
+			}
+		} else {
+			// No active writer; apply truncate to the actual path
+			if err := os.Truncate(p, int64(req.Size)); err != nil {
+				return err
+			}
 		}
 		if f.fs.Hooks != nil {
 			f.fs.Hooks.Fire(ctx, "attr_change", map[string]any{"path": relPath(f.fs.RootDir, p), "size": int64(req.Size), "kind": "file"})
