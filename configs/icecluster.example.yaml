@@ -1,0 +1,95 @@
+# icecluster example configuration
+#
+# Format: YAML
+# Notes:
+# - Durations use Go time format, e.g. "1s", "500ms", "2m30s".
+# - Paths must exist or be creatable by the process (permissions!).
+# - FUSE mount works on Linux only. On other OS the server runs without the FUSE mount.
+# - Built-in Web UI is available at http://<bind-host>/ui (enter API token if configured).
+#
+# Identity of this node (defaults to system hostname if omitted or empty)
+node_id: "node-1"
+
+# HTTP listen address for this node
+# Examples: ":9000" (all interfaces), "127.0.0.1:9000"
+bind: ":9000"
+
+# Optional: comma-separated list of peer base URLs to join on startup
+# Each must include scheme and port, e.g.: "http://host1:9000,http://host2:9000"
+join: ""
+
+# Directories
+# - data: internal state directory (currently minimal usage; reserved for future persistence)
+# - backing: real files are stored here (the FUSE fs proxies to this folder)
+# - mount: FUSE mountpoint where the virtual filesystem is exposed (Linux only)
+data: "/var/lib/icecluster"
+backing: "/srv/backing"
+mount: "/mnt/ice"
+
+# Peer keepalive probing interval and failure threshold
+# - keepalive: how often to probe peers
+# - keepalive_failures: after N consecutive failures, peer is marked DOWN and removed
+keepalive: 1m
+keepalive_failures: 1
+
+# Max allowed clock skew to peers during startup (node refuses to start if exceeded)
+clock_skew_max: 1s
+
+# Initial synchronization mode when joining peers
+# - latest: pick the newest mtime across peers/local
+# - force: always copy from cluster (first peer that has the file)
+sync_mode: "latest"
+
+# Optional periodic consistency checker
+# - consistency_interval: 0 disables. When >0, the node periodically compares indexes.
+# - consistency_mode:
+#     - report: log only
+#     - latest: auto-heal by newest timestamp
+#     - force: force from cluster
+consistency_interval: 0
+consistency_mode: "report"
+
+# Distributed lock acquisition parameters
+# - lock_timeout: max time to wait for a lock (0 means try-lock, no waiting)
+# - lock_retry: delay between retries while waiting for lock
+lock_timeout: 5s
+lock_retry: 300ms
+
+# Logging
+# - log_file: path to log file (empty -> stdout). On SIGHUP the file is reopened for rotation.
+# - log_verbose: extra logs (locks, timings). Can be noisy in production.
+log_file: ""
+log_verbose: false
+
+# Readiness requirements for load-balancers / HA probes
+# - ready_require_sync: if true and join is set, readiness requires initial sync to have completed
+# - ready_require_peer: if true, readiness requires at least one other active peer
+ready_require_sync: true
+ready_require_peer: false
+
+# API security
+# - api_token: if set, protects all /v1/* endpoints with Bearer token auth (Authorization: Bearer <token>)
+#              health (/health) and readiness (/ready, /v1/ready) remain open by default.
+# - tls_cert, tls_key: enable HTTPS if both are provided (PEM files)
+api_token: ""
+tls_cert: ""
+tls_key: ""
+
+# Lua hooks (optional)
+# - hooks_dir: directory containing Lua scripts to run on events
+#   scripts can be named by event (e.g., peer_join.lua) or placed under subdir (peer_join/*.lua)
+#   special file all.lua will receive every event
+# - hooks_timeout: max duration for a single script execution
+hooks_dir: ""
+hooks_timeout: 2s
+# - hooks_log_file: optional separate log file for Lua hooks (empty -> use main log)
+hooks_log_file: ""
+
+# Advanced: examples
+#bind: "0.0.0.0:9443"
+#join: "http://node-a:9000,http://node-b:9000"
+#consistency_interval: 10m
+#consistency_mode: "latest"
+#api_token: "supersecret"
+#tls_cert: "/etc/icecluster/certs/server.crt"
+#tls_key: "/etc/icecluster/certs/server.key"

@@ -1,0 +1,41 @@
+# Go binaries and build artifacts
+/icecluster
+/icectl
+/dist/
+/bin/
+/out/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go workspace file (usually local-only)
+go.work
+
+# Coverage and profiles
+coverage.*
+*.coverprofile
+*.cover
+*.cov
+*.lcov
+*.prof
+*.pprof
+
+# Logs and temp files
+*.log
+logs/
+*.tmp
+*.swp
+
+# Editor/OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local environment files
+.env
+.env.*

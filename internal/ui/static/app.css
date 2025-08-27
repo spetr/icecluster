@@ -1,0 +1,16 @@
+html,body,#app{height:100%;margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif;color:#111;background:#fafafa}
+.header{display:flex;align-items:center;gap:12px;padding:12px 16px;background:#0a84ff;color:#fff}
+.header h1{font-size:18px;margin:0}
+.container{padding:16px;max-width:1200px;margin:0 auto}
+.card{background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:16px;margin-bottom:16px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}
+.table{width:100%;border-collapse:collapse}
+.table th,.table td{border-bottom:1px solid #eee;padding:8px;text-align:left;font-size:13px}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px}
+.badge.ok{background:#e6ffed;color:#056b31}
+.badge.down{background:#ffe6e6;color:#a40000}
+input,button{font:inherit}
+input[type=text],input[type=password]{padding:8px 10px;border:1px solid #cbd5e1;border-radius:6px;width:260px}
+button{padding:8px 12px;border:1px solid #0a84ff;background:#0a84ff;color:#fff;border-radius:6px;cursor:pointer}
+button.secondary{background:#fff;color:#0a84ff}
+.footer{padding:12px 16px;color:#666;font-size:12px}

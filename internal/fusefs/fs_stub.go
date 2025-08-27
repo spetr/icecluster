@@ -1,0 +1,27 @@
+//go:build !linux
+// +build !linux
+
+package fusefs
+
+import (
+	"context"
+	"errors"
+	"io"
+)
+
+type Apply interface {
+	ApplyPut(path string, r io.Reader) error
+	ApplyDelete(path string) error
+}
+
+type Locker interface {
+	Lock(path string) error
+	Unlock(path string)
+}
+
+func MountAndServe(ctx context.Context, mountpoint, root string, applier Apply, locker Locker, hooks interface {
+	Fire(ctx context.Context, event string, payload map[string]any)
+	Decide(ctx context.Context, event string, payload map[string]any) (bool, map[string]any, string)
+}) error {
+	return errors.New("FUSE mount is only supported on Linux in this build")
+}

@@ -1,0 +1,70 @@
+name: release-build
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  release:
+    types: [published]
+
+jobs:
+  build:
+    name: Release Build (linux/${{ matrix.arch }}, Go ${{ matrix.go-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: [ '1.25.x' ]
+        arch: [ amd64, arm64 ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Prepare env
+        id: prep
+        run: |
+          echo "GOOS=linux" >> $GITHUB_ENV
+          echo "GOARCH=${{ matrix.arch }}" >> $GITHUB_ENV
+          echo "CGO_ENABLED=0" >> $GITHUB_ENV
+          # Enable aggressive arch tuning for amd64
+          if [ "${{ matrix.arch }}" = "amd64" ]; then echo "GOAMD64=v3" >> $GITHUB_ENV; fi
+          # Global Go flags for performance (PGO, trim debug, reproducible builds)
+          echo 'GOFLAGS=-pgo=auto -trimpath -buildvcs=false' >> $GITHUB_ENV
+
+      - name: Compute version from tag
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "VERSION=${{ github.event.release.tag_name }}" >> $GITHUB_ENV
+          else
+            echo "VERSION=${GITHUB_REF_NAME}" >> $GITHUB_ENV
+          fi
+
+      - name: Go mod download
+        run: go mod download
+
+      - name: Build icecluster (embed version)
+        run: |
+          mkdir -p dist
+          go build -tags=osusergo,netgo -ldflags "-s -w -X github.com/spetr/icecluster/internal/version.Version=${VERSION}" -o dist/icecluster-${{ matrix.arch }} ./cmd/icecluster
+
+      - name: Build icectl (embed version)
+        run: |
+          go build -tags=osusergo,netgo -ldflags "-s -w -X github.com/spetr/icecluster/internal/version.Version=${VERSION}" -o dist/icectl-${{ matrix.arch }} ./cmd/icectl
+
+      - name: Checksums
+        run: |
+          (cd dist && sha256sum * > SHA256SUMS.txt)
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.arch }}
+          path: |
+            dist/icecluster-${{ matrix.arch }}
+            dist/icectl-${{ matrix.arch }}
+            dist/SHA256SUMS.txt
