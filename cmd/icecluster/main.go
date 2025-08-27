@@ -30,10 +30,16 @@ func main() {
 	if err := logsink.Configure(cfg.LogFile, cfg.LogVerbose); err != nil {
 		log.Fatalf("log configure: %v", err)
 	}
-	// ensure dirs
-	must(os.MkdirAll(cfg.DataDir, 0755))
-	must(os.MkdirAll(cfg.Backing, 0755))
-	must(os.MkdirAll(cfg.Mount, 0755))
+	// ensure dirs (create only if missing)
+	if _, err := os.Stat(cfg.DataDir); os.IsNotExist(err) {
+		must(os.MkdirAll(cfg.DataDir, 0755))
+	}
+	if _, err := os.Stat(cfg.Backing); os.IsNotExist(err) {
+		must(os.MkdirAll(cfg.Backing, 0755))
+	}
+	if _, err := os.Stat(cfg.Mount); os.IsNotExist(err) {
+		must(os.MkdirAll(cfg.Mount, 0755))
+	}
 
 	peers := cluster.NewPeers("http://" + trimHTTPHost(cfg.BindAddr))
 	if cfg.APIToken != "" {

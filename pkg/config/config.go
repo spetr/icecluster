@@ -1,8 +1,10 @@
 package config
 
 import (
+	"bytes"
 	"flag"
 	"os"
+	"regexp"
 	"time"
 
 	yaml "gopkg.in/yaml.v3"
@@ -96,8 +98,18 @@ func FromFile(path string) (*Config, error) {
 		return nil, err
 	}
 	if err := yaml.Unmarshal(data, cfg); err != nil {
+		// Fallback: if parsing failed and consistency_interval: 0 was provided in a form
+		// that yaml cannot coerce to time.Duration, rewrite it to "0s" and retry.
+		re := regexp.MustCompile(`(?m)^(\s*consistency_interval\s*:\s*)("?0"?)\s*$`)
+		data2 := re.ReplaceAll(data, []byte("${1}\"0s\""))
+		if !bytes.Equal(data2, data) {
+			if err2 := yaml.Unmarshal(data2, cfg); err2 == nil {
+				goto post
+			}
+		}
 		return nil, err
 	}
+post:
 	// Ensure node id fallback to hostname when empty in YAML
 	if cfg.NodeID == "" {
 		if h, _ := os.Hostname(); h != "" {
