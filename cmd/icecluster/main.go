@@ -118,6 +118,8 @@ func main() {
 	})
 
 	repl := cluster.NewReplicator(peers, cfg.Backing, cfg.APIToken)
+	// Set our NodeID so replicator can skip peers that are ourselves under a different URL
+	repl.WithNodeID(cfg.NodeID)
 	lockClient := cluster.NewLockClient(peers, cfg.NodeID)
 	lockClient.Configure(cfg.LockTimeout, cfg.LockRetry)
 	lockClient.WithToken(cfg.APIToken)
