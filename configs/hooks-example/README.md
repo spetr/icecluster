@@ -25,6 +25,7 @@ Available events wired right now:
 - stat { path, kind, mode, size, mtime_ns }
 - attr_change { path, kind, mode?, size?, atime_ns?, mtime_ns? }
 - owner_change { path, kind, uid?, gid? }
+- file_sync { path }
 
 Globals available in Lua:
 - `event`: string event name

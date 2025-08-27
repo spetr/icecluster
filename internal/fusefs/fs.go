@@ -39,6 +39,7 @@ type FS struct {
 type openState struct {
 	ref     int
 	deleted bool
+	files   []*os.File
 }
 
 func (f *FS) Root() (fs.Node, error) {
@@ -46,7 +47,7 @@ func (f *FS) Root() (fs.Node, error) {
 }
 
 // registerWrite increments refcount for a path being written
-func (f *FS) registerWrite(path string) {
+func (f *FS) registerWrite(path string, fl *os.File) {
 	if f == nil {
 		return
 	}
@@ -61,10 +62,13 @@ func (f *FS) registerWrite(path string) {
 		f.open[path] = st
 	}
 	st.ref++
+	if fl != nil {
+		st.files = append(st.files, fl)
+	}
 }
 
 // unregisterWrite decrements refcount and clears state if zero; returns whether path was marked deleted
-func (f *FS) unregisterWrite(path string) (wasDeleted bool) {
+func (f *FS) unregisterWrite(path string, fl *os.File) (wasDeleted bool) {
 	if f == nil {
 		return false
 	}
@@ -72,6 +76,15 @@ func (f *FS) unregisterWrite(path string) (wasDeleted bool) {
 	defer f.openMu.Unlock()
 	if st, ok := f.open[path]; ok {
 		wasDeleted = st.deleted
+		// remove file handle
+		if fl != nil && len(st.files) > 0 {
+			for i, x := range st.files {
+				if x == fl {
+					st.files = append(st.files[:i], st.files[i+1:]...)
+					break
+				}
+			}
+		}
 		st.ref--
 		if st.ref <= 0 {
 			delete(f.open, path)
@@ -206,7 +219,7 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 		writeMode: true,
 	}
 	// track write-open on this path to handle unlink while open
-	d.fs.registerWrite(target)
+	d.fs.registerWrite(target, tmp)
 	// Return Node corresponding to the target path
 	return fh.f, fh, nil
 }
@@ -402,7 +415,7 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 		return nil, err
 	}
 	if writeMode {
-		f.fs.registerWrite(f.path)
+		f.fs.registerWrite(f.path, fl)
 	}
 	return &FileHandle{f: f, fl: fl, tmpPath: tmpPath, writeMode: writeMode}, nil
 }
@@ -418,6 +431,8 @@ var _ fs.Handle = (*FileHandle)(nil)
 var _ fs.HandleReader = (*FileHandle)(nil)
 var _ fs.HandleWriter = (*FileHandle)(nil)
 var _ fs.HandleReleaser = (*FileHandle)(nil)
+var _ fs.HandleFlusher = (*FileHandle)(nil)
+var _ fs.NodeFsyncer = (*File)(nil)
 
 func (h *FileHandle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
 	buf := make([]byte, req.Size)
@@ -455,7 +470,7 @@ func (h *FileHandle) Release(ctx context.Context, req *fuse.ReleaseRequest) erro
 	// If this was a write handle, atomically replace the target file then replicate
 	if h.writeMode && h.tmpPath != "" {
 		// check if the file was unlinked while open; if so, skip finalizing
-		wasDeleted := h.f.fs.unregisterWrite(h.f.path)
+		wasDeleted := h.f.fs.unregisterWrite(h.f.path, h.fl)
 		if wasDeleted {
 			_ = os.Remove(h.tmpPath)
 			goto unlock
@@ -499,6 +514,71 @@ unlock:
 		t0 := time.Now()
 		h.f.fs.Locker.Unlock(rp)
 		log.Printf("fuse unlock: path=%s in %s", rp, time.Since(t0))
+	}
+	return nil
+}
+
+// Fsync ensures file contents are flushed to stable storage for this handle.
+func (h *FileHandle) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
+	// req.Flags.Datasync is ignored; we just Sync the file handle
+	if h.fl != nil {
+		if err := h.fl.Sync(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Flush is called on close of a file descriptor; ensure data hits disk for write handles.
+func (h *FileHandle) Flush(ctx context.Context, req *fuse.FlushRequest) error {
+	if h.writeMode && h.fl != nil {
+		if err := h.fl.Sync(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Fsync is invoked to flush file data to disk while handle remains open.
+func (f *File) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
+	// If there's an open temp handle for this path, sync it; else sync the final path
+	f.fs.openMu.Lock()
+	st := f.fs.open[f.path]
+	var files []*os.File
+	if st != nil {
+		files = append(files, st.files...)
+	}
+	f.fs.openMu.Unlock()
+	if len(files) == 0 {
+		// sync the on-disk file if it exists
+		fl, err := os.Open(f.path)
+		if err != nil {
+			// if missing, nothing to sync
+			return nil
+		}
+		defer fl.Close()
+		if err := fl.Sync(); err != nil {
+			return err
+		}
+		if f.fs.Hooks != nil {
+			f.fs.Hooks.Fire(ctx, "file_sync", map[string]any{"path": relPath(f.fs.RootDir, f.path)})
+		}
+		return nil
+	}
+	var firstErr error
+	for _, fl := range files {
+		if fl == nil {
+			continue
+		}
+		if err := fl.Sync(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	if f.fs.Hooks != nil {
+		f.fs.Hooks.Fire(ctx, "file_sync", map[string]any{"path": relPath(f.fs.RootDir, f.path)})
 	}
 	return nil
 }
