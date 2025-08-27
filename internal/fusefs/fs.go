@@ -456,42 +456,50 @@ func (h *FileHandle) Release(ctx context.Context, req *fuse.ReleaseRequest) erro
 	if err := h.fl.Close(); err != nil {
 		return err
 	}
-	// replicate the file if it still exists and this was a write handle
+	// Capture write/deletion state, then release the cluster lock before any replication
+	var (
+		shouldReplicate bool
+		targetPath      string
+	)
 	if h.writeMode {
-		// unregister write tracking; optionally honor delete-while-open
 		wasDeleted := h.f.fs.unregisterWrite(h.f.path, h.fl)
-		if wasDeleted {
-			// skip replicate; file was deleted while open
-			goto after_unlock
-		}
-		// allow hook to block or rewrite the path before replication
-		target := h.f.path
-		if h.f.fs.Hooks != nil {
-			rp := relPath(h.f.fs.RootDir, target)
-			if allow, patch, reason := h.f.fs.Hooks.Decide(ctx, "file_put", map[string]any{"path": rp}); !allow {
-				log.Printf("hook deny file_put %s: %s", rp, reason)
-				// keep lock handling outside; Release will still unlock below
-				return syscall.Errno(syscall.EPERM)
-			} else if v, ok := patch["path"].(string); ok && v != "" {
-				target = filepath.Join(h.f.fs.RootDir, v)
-			}
-		}
-		if fi, err := os.Stat(target); err == nil {
-			log.Printf("fuse write commit: path=%s size=%d", relPath(h.f.fs.RootDir, target), fi.Size())
-			if f, err := os.Open(target); err == nil {
-				defer f.Close()
-				if err := h.f.fs.Apply.ApplyPut(relPath(h.f.fs.RootDir, target), f); err != nil {
-					log.Printf("replicate put: %v", err)
+		if !wasDeleted {
+			// allow hook to block or rewrite the path before replication
+			target := h.f.path
+			if h.f.fs.Hooks != nil {
+				rp := relPath(h.f.fs.RootDir, target)
+				if allow, patch, reason := h.f.fs.Hooks.Decide(ctx, "file_put", map[string]any{"path": rp}); !allow {
+					log.Printf("hook deny file_put %s: %s", rp, reason)
+					// do not replicate; proceed to unlock
+				} else if v, ok := patch["path"].(string); ok && v != "" {
+					target = filepath.Join(h.f.fs.RootDir, v)
 				}
+			}
+			// if file exists, we'll replicate after unlocking
+			if _, err := os.Stat(target); err == nil {
+				shouldReplicate = true
+				targetPath = target
 			}
 		}
 	}
-after_unlock:
+	// Always unlock before any replication to ensure we don't replicate while a lock exists
 	if h.f.fs.Locker != nil {
 		rp := relPath(h.f.fs.RootDir, h.f.path)
 		t0 := time.Now()
 		h.f.fs.Locker.Unlock(rp)
 		log.Printf("fuse unlock: path=%s in %s", rp, time.Since(t0))
+	}
+	// Perform replication only after unlocking
+	if shouldReplicate {
+		if fi, err := os.Stat(targetPath); err == nil {
+			log.Printf("fuse write commit: path=%s size=%d", relPath(h.f.fs.RootDir, targetPath), fi.Size())
+			if f, err := os.Open(targetPath); err == nil {
+				defer f.Close()
+				if err := h.f.fs.Apply.ApplyPut(relPath(h.f.fs.RootDir, targetPath), f); err != nil {
+					log.Printf("replicate put: %v", err)
+				}
+			}
+		}
 	}
 	return nil
 }

@@ -17,6 +17,10 @@ type Replicator struct {
 	Token string
 	// MyNodeID is this node's ID; peers with the same NodeID are skipped to prevent self-replication via alternate URLs
 	MyNodeID string
+	// Locker allows the replicator to respect locks by skipping replication when a file is locked
+	Locker interface {
+		Holder(path string) (string, bool)
+	}
 }
 
 type Applier func(peer string, path string, r io.Reader) error
@@ -36,6 +40,17 @@ func (r *Replicator) WithNodeID(id string) *Replicator { r.MyNodeID = id; return
 func (r *Replicator) ApplyPut(path string, body io.Reader) error {
 	// write to local backing dir
 	start := time.Now()
+	// If locked by anyone (including self), skip replication fan-out; still write local to keep state
+	if r.Locker != nil {
+		if holder, ok := r.Locker.Holder("/" + path); ok && holder != "" {
+			// write local only, but do not fan out
+			if err := writeLocal(filepath.Join(r.Root, path), body); err != nil {
+				return err
+			}
+			log.Printf("replicate: PUT skipped (locked by %s) %s", holder, path)
+			return nil
+		}
+	}
 	buf := new(bytes.Buffer)
 	tee := io.TeeReader(body, buf)
 	if err := writeLocal(filepath.Join(r.Root, path), tee); err != nil {
@@ -72,6 +87,13 @@ func (r *Replicator) ApplyPut(path string, body io.Reader) error {
 }
 
 func (r *Replicator) ApplyDelete(path string) error {
+	// If locked, skip replication (and local delete) to honor lock semantics
+	if r.Locker != nil {
+		if holder, ok := r.Locker.Holder("/" + path); ok && holder != "" {
+			log.Printf("replicate: DEL skipped (locked by %s) %s", holder, path)
+			return nil
+		}
+	}
 	t0 := time.Now()
 	_ = removeLocal(filepath.Join(r.Root, path))
 	log.Printf("replicate: local DEL %s in %s", path, time.Since(t0))
