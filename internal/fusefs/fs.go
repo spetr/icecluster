@@ -37,6 +37,12 @@ type FS struct {
 	// If true, honoring delete while open means skipping finalize on close
 }
 
+// Locker coordinates cross-node file access.
+type Locker interface {
+	Lock(path string) error
+	Unlock(path string)
+}
+
 type openState struct {
 	ref     int
 	deleted bool
@@ -121,6 +127,7 @@ var _ fs.NodeMkdirer = (*Dir)(nil)
 var _ fs.NodeRenamer = (*Dir)(nil)
 var _ fs.NodeSetattrer = (*Dir)(nil)
 var _ fs.NodeCreater = (*Dir)(nil)
+var _ fs.NodeRemover = (*Dir)(nil)
 
 func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
 	fi, err := os.Stat(d.dir)
@@ -281,6 +288,56 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Nod
 	return nil
 }
 
+// Remove implements removal for files and directories.
+func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
+	p := filepath.Join(d.dir, req.Name)
+	log.Printf("fuse delete: path=%s", relPath(d.fs.RootDir, req.Name))
+	if req.Dir {
+		if d.fs.Hooks != nil {
+			if allow, patch, reason := d.fs.Hooks.Decide(ctx, "dir_delete", map[string]any{"path": relPath(d.fs.RootDir, p)}); !allow {
+				log.Printf("hook deny dir_delete %s: %s", p, reason)
+				return syscall.Errno(syscall.EPERM)
+			} else if v, ok := patch["path"].(string); ok && v != "" {
+				p = filepath.Join(d.fs.RootDir, v)
+			}
+		}
+		// For safety, remove only if empty; return ENOTEMPTY otherwise
+		if err := os.Remove(p); err != nil {
+			// map directory not empty to proper fuse error
+			if os.IsExist(err) || err == syscall.ENOTEMPTY { // platform differences
+				return fuse.Errno(syscall.ENOTEMPTY)
+			}
+			return err
+		}
+		log.Printf("fuse rmdir: path=%s", relPath(d.fs.RootDir, p))
+		if d.fs.Hooks != nil {
+			d.fs.Hooks.Fire(ctx, "dir_delete", map[string]any{"path": relPath(d.fs.RootDir, p)})
+		}
+		return nil
+	}
+	if d.fs.Hooks != nil {
+		// allow scripts to block or rewrite file path before delete
+		if allow, patch, reason := d.fs.Hooks.Decide(ctx, "file_delete", map[string]any{"path": relPath(d.fs.RootDir, p)}); !allow {
+			log.Printf("hook deny file_delete %s: %s", p, reason)
+			return syscall.Errno(syscall.EPERM)
+		} else if v, ok := patch["path"].(string); ok && v != "" {
+			p = filepath.Join(d.fs.RootDir, v)
+		}
+	}
+	if err := os.Remove(p); err != nil {
+		return err
+	}
+	// mark as deleted while potential writers may still have the file open
+	d.fs.markDeleted(p)
+	// replicate delete
+	if err := d.fs.Apply.ApplyDelete(relPath(d.fs.RootDir, p)); err != nil {
+		log.Printf("replicate delete failed: path=%s err=%v", relPath(d.fs.RootDir, p), err)
+		return err
+	}
+	log.Printf("fuse delete replicated: path=%s", relPath(d.fs.RootDir, p))
+	return nil
+}
+
 // Setattr applies attribute changes to a directory and fires hooks.
 func (d *Dir) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
 	p := d.dir
@@ -342,15 +399,11 @@ type File struct {
 	fs   *FS
 	path string
 }
-type Locker interface {
-	Lock(path string) error
-	Unlock(path string)
-}
 
 var _ fs.Node = (*File)(nil)
 var _ fs.NodeOpener = (*File)(nil)
-var _ fs.NodeRemover = (*Dir)(nil)
 var _ fs.NodeSetattrer = (*File)(nil)
+var _ fs.NodeFsyncer = (*File)(nil)
 
 func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 	fi, err := os.Stat(f.path)
@@ -406,6 +459,94 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 	return &FileHandle{f: f, fl: fl, tmpPath: "", writeMode: writeMode}, nil
 }
 
+// Setattr applies attribute/owner/size changes to a file and fires hooks.
+func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
+	p := f.path
+	// Size (truncate)
+	if req.Valid.Size() {
+		// Apply truncate directly to the actual path
+		if err := os.Truncate(p, int64(req.Size)); err != nil {
+			return err
+		}
+		logsink.Vprintf("fuse setattr(file:size): path=%s size=%d", relPath(f.fs.RootDir, p), int64(req.Size))
+		if f.fs.Hooks != nil {
+			f.fs.Hooks.Fire(ctx, "attr_change", map[string]any{"path": relPath(f.fs.RootDir, p), "size": int64(req.Size), "kind": "file"})
+		}
+	}
+	// Ownership
+	if req.Valid.Uid() || req.Valid.Gid() {
+		uid := -1
+		gid := -1
+		if req.Valid.Uid() {
+			uid = int(req.Uid)
+		}
+		if req.Valid.Gid() {
+			gid = int(req.Gid)
+		}
+		if err := os.Chown(p, uid, gid); err != nil {
+			return err
+		}
+		logsink.Vprintf("fuse setattr(file:owner): path=%s uid=%d gid=%d", relPath(f.fs.RootDir, p), uid, gid)
+		if f.fs.Hooks != nil {
+			f.fs.Hooks.Fire(ctx, "owner_change", map[string]any{"path": relPath(f.fs.RootDir, p), "uid": int(req.Uid), "gid": int(req.Gid), "kind": "file"})
+		}
+	}
+	// Mode
+	if req.Valid.Mode() {
+		if err := os.Chmod(p, req.Mode); err != nil {
+			return err
+		}
+		logsink.Vprintf("fuse setattr(file:mode): path=%s mode=%#o", relPath(f.fs.RootDir, p), uint32(req.Mode))
+		if f.fs.Hooks != nil {
+			f.fs.Hooks.Fire(ctx, "attr_change", map[string]any{"path": relPath(f.fs.RootDir, p), "mode": uint32(req.Mode), "kind": "file"})
+		}
+	}
+	// Times
+	if req.Valid.Mtime() || req.Valid.Atime() {
+		at := time.Now()
+		mt := time.Now()
+		if req.Valid.Atime() {
+			at = req.Atime
+		}
+		if req.Valid.Mtime() {
+			mt = req.Mtime
+		}
+		if err := os.Chtimes(p, at, mt); err != nil {
+			return err
+		}
+		logsink.Vprintf("fuse setattr(file:times): path=%s atime=%d mtime=%d", relPath(f.fs.RootDir, p), at.UnixNano(), mt.UnixNano())
+		if f.fs.Hooks != nil {
+			f.fs.Hooks.Fire(ctx, "attr_change", map[string]any{"path": relPath(f.fs.RootDir, p), "atime_ns": at.UnixNano(), "mtime_ns": mt.UnixNano(), "kind": "file"})
+		}
+	}
+	// Reply with updated attrs
+	if fi, err := os.Stat(p); err == nil {
+		resp.Attr.Mode = fi.Mode()
+		resp.Attr.Size = uint64(fi.Size())
+		resp.Attr.Mtime = fi.ModTime()
+	}
+	return nil
+}
+
+// Fsync flushes file data to disk for the given node (independent of handle).
+func (f *File) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
+	// sync the on-disk file if it exists
+	fl, err := os.Open(f.path)
+	if err != nil {
+		// if missing, nothing to sync
+		return nil
+	}
+	defer fl.Close()
+	if err := fl.Sync(); err != nil {
+		return err
+	}
+	if f.fs.Hooks != nil {
+		f.fs.Hooks.Fire(ctx, "file_sync", map[string]any{"path": relPath(f.fs.RootDir, f.path)})
+	}
+	logsink.Vprintf("fuse fsync(node): path=%s", relPath(f.fs.RootDir, f.path))
+	return nil
+}
+
 type FileHandle struct {
 	f         *File
 	fl        *os.File
@@ -418,7 +559,6 @@ var _ fs.HandleReader = (*FileHandle)(nil)
 var _ fs.HandleWriter = (*FileHandle)(nil)
 var _ fs.HandleReleaser = (*FileHandle)(nil)
 var _ fs.HandleFlusher = (*FileHandle)(nil)
-var _ fs.NodeFsyncer = (*File)(nil)
 
 func (h *FileHandle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
 	buf := make([]byte, req.Size)
@@ -528,92 +668,6 @@ func (h *FileHandle) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 }
 
 // Fsync is invoked to flush file data to disk while handle remains open.
-func (f *File) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
-	// sync the on-disk file if it exists
-	fl, err := os.Open(f.path)
-	if err != nil {
-		// if missing, nothing to sync
-		return nil
-	}
-	defer fl.Close()
-	if err := fl.Sync(); err != nil {
-		return err
-	}
-	if f.fs.Hooks != nil {
-		f.fs.Hooks.Fire(ctx, "file_sync", map[string]any{"path": relPath(f.fs.RootDir, f.path)})
-	}
-	logsink.Vprintf("fuse fsync(node): path=%s", relPath(f.fs.RootDir, f.path))
-	return nil
-}
-
-// Setattr applies attribute/owner/size changes to a file and fires hooks.
-func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
-	p := f.path
-	// Size (truncate)
-	if req.Valid.Size() {
-		// Apply truncate directly to the actual path
-		if err := os.Truncate(p, int64(req.Size)); err != nil {
-			return err
-		}
-		logsink.Vprintf("fuse setattr(file:size): path=%s size=%d", relPath(f.fs.RootDir, p), int64(req.Size))
-		if f.fs.Hooks != nil {
-			f.fs.Hooks.Fire(ctx, "attr_change", map[string]any{"path": relPath(f.fs.RootDir, p), "size": int64(req.Size), "kind": "file"})
-		}
-	}
-	// Ownership
-	if req.Valid.Uid() || req.Valid.Gid() {
-		uid := -1
-		gid := -1
-		if req.Valid.Uid() {
-			uid = int(req.Uid)
-		}
-		if req.Valid.Gid() {
-			gid = int(req.Gid)
-		}
-		if err := os.Chown(p, uid, gid); err != nil {
-			return err
-		}
-		logsink.Vprintf("fuse setattr(file:owner): path=%s uid=%d gid=%d", relPath(f.fs.RootDir, p), uid, gid)
-		if f.fs.Hooks != nil {
-			f.fs.Hooks.Fire(ctx, "owner_change", map[string]any{"path": relPath(f.fs.RootDir, p), "uid": int(req.Uid), "gid": int(req.Gid), "kind": "file"})
-		}
-	}
-	// Mode
-	if req.Valid.Mode() {
-		if err := os.Chmod(p, req.Mode); err != nil {
-			return err
-		}
-		logsink.Vprintf("fuse setattr(file:mode): path=%s mode=%#o", relPath(f.fs.RootDir, p), uint32(req.Mode))
-		if f.fs.Hooks != nil {
-			f.fs.Hooks.Fire(ctx, "attr_change", map[string]any{"path": relPath(f.fs.RootDir, p), "mode": uint32(req.Mode), "kind": "file"})
-		}
-	}
-	// Times
-	if req.Valid.Mtime() || req.Valid.Atime() {
-		at := time.Now()
-		mt := time.Now()
-		if req.Valid.Atime() {
-			at = req.Atime
-		}
-		if req.Valid.Mtime() {
-			mt = req.Mtime
-		}
-		if err := os.Chtimes(p, at, mt); err != nil {
-			return err
-		}
-		logsink.Vprintf("fuse setattr(file:times): path=%s atime=%d mtime=%d", relPath(f.fs.RootDir, p), at.UnixNano(), mt.UnixNano())
-		if f.fs.Hooks != nil {
-			f.fs.Hooks.Fire(ctx, "attr_change", map[string]any{"path": relPath(f.fs.RootDir, p), "atime_ns": at.UnixNano(), "mtime_ns": mt.UnixNano(), "kind": "file"})
-		}
-	}
-	// Reply with updated attrs
-	if fi, err := os.Stat(p); err == nil {
-		resp.Attr.Mode = fi.Mode()
-		resp.Attr.Size = uint64(fi.Size())
-		resp.Attr.Mtime = fi.ModTime()
-	}
-	return nil
-}
 
 func relPath(root, p string) string {
 	r, err := filepath.Rel(root, p)
@@ -666,54 +720,4 @@ func MountAndServe(ctx context.Context, mountpoint, root string, applier Apply, 
 // Unmount requests unmount of the given mountpoint (Linux build).
 func Unmount(mountpoint string) error {
 	return fuse.Unmount(mountpoint)
-}
-
-// FS implements removal via Dir.Remove
-func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
-	p := filepath.Join(d.dir, req.Name)
-	log.Printf("fuse delete: path=%s", relPath(d.fs.RootDir, req.Name))
-	if req.Dir {
-		if d.fs.Hooks != nil {
-			if allow, patch, reason := d.fs.Hooks.Decide(ctx, "dir_delete", map[string]any{"path": relPath(d.fs.RootDir, p)}); !allow {
-				log.Printf("hook deny dir_delete %s: %s", p, reason)
-				return syscall.Errno(syscall.EPERM)
-			} else if v, ok := patch["path"].(string); ok && v != "" {
-				p = filepath.Join(d.fs.RootDir, v)
-			}
-		}
-		// For safety, remove only if empty; return ENOTEMPTY otherwise
-		if err := os.Remove(p); err != nil {
-			// map directory not empty to proper fuse error
-			if os.IsExist(err) || err == syscall.ENOTEMPTY { // platform differences
-				return fuse.Errno(syscall.ENOTEMPTY)
-			}
-			return err
-		}
-		log.Printf("fuse rmdir: path=%s", relPath(d.fs.RootDir, p))
-		if d.fs.Hooks != nil {
-			d.fs.Hooks.Fire(ctx, "dir_delete", map[string]any{"path": relPath(d.fs.RootDir, p)})
-		}
-		return nil
-	}
-	if d.fs.Hooks != nil {
-		// allow scripts to block or rewrite file path before delete
-		if allow, patch, reason := d.fs.Hooks.Decide(ctx, "file_delete", map[string]any{"path": relPath(d.fs.RootDir, p)}); !allow {
-			log.Printf("hook deny file_delete %s: %s", p, reason)
-			return syscall.Errno(syscall.EPERM)
-		} else if v, ok := patch["path"].(string); ok && v != "" {
-			p = filepath.Join(d.fs.RootDir, v)
-		}
-	}
-	if err := os.Remove(p); err != nil {
-		return err
-	}
-	// mark as deleted while potential writers may still have the file open
-	d.fs.markDeleted(p)
-	// replicate delete
-	if err := d.fs.Apply.ApplyDelete(relPath(d.fs.RootDir, p)); err != nil {
-		log.Printf("replicate delete failed: path=%s err=%v", relPath(d.fs.RootDir, p), err)
-		return err
-	}
-	log.Printf("fuse delete replicated: path=%s", relPath(d.fs.RootDir, p))
-	return nil
 }

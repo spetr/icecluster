@@ -24,8 +24,6 @@ type Replicator struct {
 	}
 }
 
-type Applier func(peer string, path string, r io.Reader) error
-
 type ApplyService interface {
 	ApplyPut(path string, r io.Reader) error
 	ApplyDelete(path string) error
@@ -143,6 +141,7 @@ func (r *Replicator) ApplyDelete(path string) error {
 	return nil
 }
 
+// writeLocal stores the reader atomically to the given absolute path within Root.
 func writeLocal(path string, r io.Reader) error {
 	if err := ensureDir(filepath.Dir(path)); err != nil {
 		return err
