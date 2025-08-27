@@ -60,6 +60,15 @@ jobs:
         run: |
           (cd dist && sha256sum * > SHA256SUMS.txt)
 
+      - name: Create tarball
+        run: |
+          NAME="icecluster-${VERSION}-linux-${{ matrix.arch }}"
+          # package binaries with generic names inside the archive
+          cp dist/icecluster-${{ matrix.arch }} dist/icecluster
+          cp dist/icectl-${{ matrix.arch }} dist/icectl
+          tar -C dist -czf dist/${NAME}.tar.gz icecluster icectl
+          rm -f dist/icecluster dist/icectl
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -68,3 +77,11 @@ jobs:
             dist/icecluster-${{ matrix.arch }}
             dist/icectl-${{ matrix.arch }}
             dist/SHA256SUMS.txt
+            dist/icecluster-${VERSION}-linux-${{ matrix.arch }}.tar.gz
+
+      - name: Upload release assets
+        if: github.event_name == 'release' && github.event.action == 'published'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/icecluster-${VERSION}-linux-${{ matrix.arch }}.tar.gz
