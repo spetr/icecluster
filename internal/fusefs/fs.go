@@ -145,7 +145,7 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	logsink.Vprintf("fuse readdir: path=%s entries=%d", relPath(d.fs.RootDir, d.dir), len(res))
 	if d.fs.Hooks != nil {
 		if allow, _, _ := d.fs.Hooks.Decide(ctx, "dir_list", map[string]any{"path": relPath(d.fs.RootDir, d.dir)}); !allow {
-			return nil, fuse.EPERM
+			return nil, syscall.Errno(syscall.EPERM)
 		}
 		d.fs.Hooks.Fire(ctx, "dir_list", map[string]any{"path": relPath(d.fs.RootDir, d.dir)})
 	}
@@ -210,7 +210,7 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 		rel := relPath(d.fs.RootDir, p)
 		if allow, patch, reason := d.fs.Hooks.Decide(ctx, "dir_create", map[string]any{"path": rel, "mode": uint32(req.Mode)}); !allow {
 			log.Printf("hook deny dir_create %s: %s", rel, reason)
-			return nil, fuse.EPERM
+			return nil, syscall.Errno(syscall.EPERM)
 		} else if v, ok := patch["path"].(string); ok && v != "" {
 			p = filepath.Join(d.fs.RootDir, v)
 		}
@@ -236,7 +236,7 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Nod
 	if d.fs.Hooks != nil {
 		if allow, patch, reason := d.fs.Hooks.Decide(ctx, "file_rename", map[string]any{"old": relPath(d.fs.RootDir, oldPath), "new": relPath(d.fs.RootDir, newPath)}); !allow {
 			log.Printf("hook deny rename %s -> %s: %s", oldPath, newPath, reason)
-			return fuse.EPERM
+			return syscall.Errno(syscall.EPERM)
 		} else {
 			if v, ok := patch["old"].(string); ok && v != "" {
 				oldPath = filepath.Join(d.fs.RootDir, v)
@@ -414,7 +414,7 @@ func (h *FileHandle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse
 	resp.Data = buf[:n]
 	if h.f.fs.Hooks != nil {
 		if allow, _, _ := h.f.fs.Hooks.Decide(ctx, "file_read", map[string]any{"path": relPath(h.f.fs.RootDir, h.f.path), "offset": req.Offset, "size": n}); !allow {
-			return fuse.EPERM
+			return syscall.Errno(syscall.EPERM)
 		}
 		h.f.fs.Hooks.Fire(ctx, "file_read", map[string]any{"path": relPath(h.f.fs.RootDir, h.f.path), "offset": req.Offset, "size": n})
 	}
@@ -456,7 +456,7 @@ func (h *FileHandle) Release(ctx context.Context, req *fuse.ReleaseRequest) erro
 			if allow, patch, reason := h.f.fs.Hooks.Decide(ctx, "file_put", map[string]any{"path": rp}); !allow {
 				log.Printf("hook deny file_put %s: %s", rp, reason)
 				// keep lock handling outside; Release will still unlock below
-				return fuse.EPERM
+				return syscall.Errno(syscall.EPERM)
 			} else if v, ok := patch["path"].(string); ok && v != "" {
 				target = filepath.Join(h.f.fs.RootDir, v)
 			}
@@ -652,7 +652,7 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 		if d.fs.Hooks != nil {
 			if allow, patch, reason := d.fs.Hooks.Decide(ctx, "dir_delete", map[string]any{"path": relPath(d.fs.RootDir, p)}); !allow {
 				log.Printf("hook deny dir_delete %s: %s", p, reason)
-				return fuse.EPERM
+				return syscall.Errno(syscall.EPERM)
 			} else if v, ok := patch["path"].(string); ok && v != "" {
 				p = filepath.Join(d.fs.RootDir, v)
 			}
@@ -675,7 +675,7 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 		// allow scripts to block or rewrite file path before delete
 		if allow, patch, reason := d.fs.Hooks.Decide(ctx, "file_delete", map[string]any{"path": relPath(d.fs.RootDir, p)}); !allow {
 			log.Printf("hook deny file_delete %s: %s", p, reason)
-			return fuse.EPERM
+			return syscall.Errno(syscall.EPERM)
 		} else if v, ok := patch["path"].(string); ok && v != "" {
 			p = filepath.Join(d.fs.RootDir, v)
 		}
