@@ -19,12 +19,19 @@ type Locker interface {
 	Unlock(path string)
 }
 
+type Options struct {
+	AllowDeleteWhileLocked bool
+}
+
 func MountAndServe(ctx context.Context, mountpoint, root string, applier Apply, locker Locker, hooks interface {
 	Fire(ctx context.Context, event string, payload map[string]any)
 	Decide(ctx context.Context, event string, payload map[string]any) (bool, map[string]any, string)
-}) error {
+}, opts ...Options) error {
 	return errors.New("FUSE mount is only supported on Linux in this build")
 }
 
 // Unmount is a no-op on non-Linux builds.
 func Unmount(mountpoint string) error { return nil }
+
+// UpdateOptions is a no-op on non-Linux builds.
+func UpdateOptions(o Options) {}

@@ -61,6 +61,11 @@ lock_retry: 300ms
 log_file: ""
 log_verbose: false
 
+# Deletion semantics
+# - allow_delete_while_locked: when true, deleting a file that has an open writer will not be undone
+#   by the writer's close (i.e., finalize will be skipped). Default false keeps the new content.
+allow_delete_while_locked: false
+
 # Readiness requirements for load-balancers / HA probes
 # - ready_require_sync: if true and join is set, readiness requires initial sync to have completed
 # - ready_require_peer: if true, readiness requires at least one other active peer

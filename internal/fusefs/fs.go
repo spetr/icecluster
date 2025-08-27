@@ -34,6 +34,8 @@ type FS struct {
 	// track open write handles to handle unlink-while-open (e.g., vim swap files)
 	openMu sync.Mutex
 	open   map[string]*openState
+	// If true, honoring delete while open means skipping finalize on close
+	AllowDeleteWhileLocked bool
 }
 
 type openState struct {
@@ -44,6 +46,11 @@ type openState struct {
 
 func (f *FS) Root() (fs.Node, error) {
 	return &Dir{fs: f, dir: f.RootDir}, nil
+}
+
+// WithOptions applies runtime options to the filesystem instance
+func (f *FS) WithOptions(allowDeleteWhileLocked bool) {
+	f.AllowDeleteWhileLocked = allowDeleteWhileLocked
 }
 
 // registerWrite increments refcount for a path being written
@@ -515,9 +522,13 @@ func (h *FileHandle) Release(ctx context.Context, req *fuse.ReleaseRequest) erro
 	}
 	// If this was a write handle, atomically replace the target file then replicate
 	if h.writeMode && h.tmpPath != "" {
-		// unregister write tracking; proceed to finalize even if target was unlinked
-		// Editors (e.g., vim) often unlink before rename as part of atomic save.
-		_ = h.f.fs.unregisterWrite(h.f.path, h.fl)
+		// unregister write tracking; optionally honor delete-while-open
+		wasDeleted := h.f.fs.unregisterWrite(h.f.path, h.fl)
+		if wasDeleted && h.f.fs.AllowDeleteWhileLocked {
+			_ = os.Remove(h.tmpPath)
+			// skip finalize; file stays deleted per config
+			goto after_unlock
+		}
 		// allow hook to block or rewrite the path before finalizing
 		target := h.f.path
 		if h.f.fs.Hooks != nil {
@@ -551,6 +562,7 @@ func (h *FileHandle) Release(ctx context.Context, req *fuse.ReleaseRequest) erro
 			}
 		}
 	}
+after_unlock:
 	if h.f.fs.Locker != nil {
 		rp := relPath(h.f.fs.RootDir, h.f.path)
 		t0 := time.Now()
@@ -717,10 +729,18 @@ func relPath(root, p string) string {
 	return r
 }
 
+type Options struct {
+	AllowDeleteWhileLocked bool
+}
+
+// keep a reference to the mounted FS to allow runtime option updates (e.g., on SIGHUP)
+var mountedFSMu sync.Mutex
+var mountedFS *FS
+
 func MountAndServe(ctx context.Context, mountpoint, root string, applier Apply, locker Locker, hooks interface {
 	Fire(ctx context.Context, event string, payload map[string]any)
 	Decide(ctx context.Context, event string, payload map[string]any) (bool, map[string]any, string)
-}) error {
+}, opts ...Options) error {
 	// Attempt to mount; if it fails (possibly due to stale mount), unmount and retry once.
 	c, err := fuse.Mount(mountpoint, fuse.FSName("icecluster"), fuse.Subtype("ice"))
 	if err != nil {
@@ -744,6 +764,12 @@ func MountAndServe(ctx context.Context, mountpoint, root string, applier Apply, 
 	}()
 
 	fsys := &FS{RootDir: root, Apply: applier, Locker: locker, Hooks: hooks}
+	if len(opts) > 0 {
+		fsys.AllowDeleteWhileLocked = opts[0].AllowDeleteWhileLocked
+	}
+	mountedFSMu.Lock()
+	mountedFS = fsys
+	mountedFSMu.Unlock()
 	// Cleanup any stale temp files from previous crashes in the backing store
 	cleanStaleTemps(root)
 	return fs.Serve(c, fsys)
@@ -752,6 +778,16 @@ func MountAndServe(ctx context.Context, mountpoint, root string, applier Apply, 
 // Unmount requests unmount of the given mountpoint (Linux build).
 func Unmount(mountpoint string) error {
 	return fuse.Unmount(mountpoint)
+}
+
+// UpdateOptions applies runtime options to the currently mounted filesystem instance.
+// No-op if the filesystem isn't mounted on this process.
+func UpdateOptions(o Options) {
+	mountedFSMu.Lock()
+	defer mountedFSMu.Unlock()
+	if mountedFS != nil {
+		mountedFS.WithOptions(o.AllowDeleteWhileLocked)
+	}
 }
 
 // FS implements removal via Dir.Remove
