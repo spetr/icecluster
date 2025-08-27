@@ -499,14 +499,35 @@ func MountAndServe(ctx context.Context, mountpoint, root string, applier Apply, 
 	Fire(ctx context.Context, event string, payload map[string]any)
 	Decide(ctx context.Context, event string, payload map[string]any) (bool, map[string]any, string)
 }) error {
+	// Attempt to mount; if it fails (possibly due to stale mount), unmount and retry once.
 	c, err := fuse.Mount(mountpoint, fuse.FSName("icecluster"), fuse.Subtype("ice"))
 	if err != nil {
-		return err
+		_ = fuse.Unmount(mountpoint)
+		time.Sleep(200 * time.Millisecond)
+		c, err = fuse.Mount(mountpoint, fuse.FSName("icecluster"), fuse.Subtype("ice"))
+		if err != nil {
+			return err
+		}
 	}
-	defer c.Close()
+	// Ensure connection close and best-effort unmount on exit
+	defer func() {
+		_ = fuse.Unmount(mountpoint)
+		c.Close()
+	}()
+
+	// On context cancellation, request unmount so the next start doesn't require manual fusermount3 -u
+	go func() {
+		<-ctx.Done()
+		_ = fuse.Unmount(mountpoint)
+	}()
 
 	fsys := &FS{RootDir: root, Apply: applier, Locker: locker, Hooks: hooks}
 	return fs.Serve(c, fsys)
+}
+
+// Unmount requests unmount of the given mountpoint (Linux build).
+func Unmount(mountpoint string) error {
+	return fuse.Unmount(mountpoint)
 }
 
 // FS implements removal via Dir.Remove

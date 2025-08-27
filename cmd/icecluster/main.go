@@ -231,6 +231,8 @@ func main() {
 	// Notify peers about shutdown so they can remove us
 	peers.Leave()
 	readyFlag.Store(false)
+	// best-effort unmount FUSE before exit
+	_ = fusefs.Unmount(cfg.Mount)
 	_ = server.Shutdown(context.Background())
 }
 

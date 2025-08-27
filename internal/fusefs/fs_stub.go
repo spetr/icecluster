@@ -25,3 +25,6 @@ func MountAndServe(ctx context.Context, mountpoint, root string, applier Apply, 
 }) error {
 	return errors.New("FUSE mount is only supported on Linux in this build")
 }
+
+// Unmount is a no-op on non-Linux builds.
+func Unmount(mountpoint string) error { return nil }
