@@ -83,6 +83,9 @@ func main() {
 	log.Printf("peers: %v", peers.List())
 	// Create lock manager early so KeepAlive onDown can use it
 	locks := locking.NewManager()
+	if err := syncLocks(peers, locks, cfg.APIToken); err != nil {
+		log.Printf("initial lock sync failed: %v", err)
+	}
 
 	// Start keepalive with recovery hook that re-registers and reconciles files
 	peers.KeepAlive(cfg.Keepalive, log.Printf, cfg.KeepaliveFailures, func(peer string) {
@@ -93,9 +96,17 @@ func main() {
 			req.Header.Set("Authorization", "Bearer "+cfg.APIToken)
 		}
 		_, _ = (&http.Client{Timeout: 5 * time.Second}).Do(req)
-		// Then run a targeted sync in 'latest' mode to reconcile drift caused by outage
+		// Reconcile any file drift caused by outage; skip lock sync if this fails
 		if err := initialSync(peers, cfg.Backing, "latest", cfg.APIToken); err != nil {
 			log.Printf("recovery sync with %s failed: %v", peer, err)
+			return
+		}
+		if inc := runConsistency(peers, cfg.Backing, "", cfg.APIToken); inc > 0 {
+			log.Printf("recovery: %d inconsistent file(s) remain after sync with %s; skipping lock sync", inc, peer)
+			return
+		}
+		if err := syncLocks(peers, locks, cfg.APIToken); err != nil {
+			log.Printf("lock sync with %s failed: %v", peer, err)
 		}
 	}, func(peer string) {
 		// On down, release all locks held by that peer's node ID (if known)
@@ -222,7 +233,7 @@ func main() {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					runConsistency(peers, cfg.Backing, cfg.ConsistencyMode, cfg.APIToken)
+					_ = runConsistency(peers, cfg.Backing, cfg.ConsistencyMode, cfg.APIToken)
 				}
 			}
 		}()
@@ -450,9 +461,39 @@ func fetchFileFromAnyPeer(peers *cluster.Peers, path, root string, client *http.
 	return fmt.Errorf("no peer had file %s", path)
 }
 
+// syncLocks retrieves lock state from the cluster coordinator and loads it into local manager.
+func syncLocks(peers *cluster.Peers, locks *locking.Manager, token string) error {
+	if peers == nil || locks == nil {
+		return nil
+	}
+	coord := peers.Coordinator()
+	if coord == "" || coord == peers.Self() {
+		return nil
+	}
+	req, _ := http.NewRequest(http.MethodGet, coord+"/v1/locks", nil)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return fmt.Errorf("lock sync: %s", resp.Status)
+	}
+	var list []locking.Info
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return err
+	}
+	locks.Load(list)
+	return nil
+}
+
 // runConsistency computes differences across peers and logs a concise summary.
-// If mode is 'latest' or 'force', it will call initialSync to heal.
-func runConsistency(peers *cluster.Peers, root string, mode string, token string) {
+// It returns the number of inconsistent files found. If mode is 'latest' or
+// 'force', it will call initialSync to heal after reporting.
+func runConsistency(peers *cluster.Peers, root string, mode string, token string) int {
 	// Gather peer indexes
 	type entry struct {
 		Path  string
@@ -544,4 +585,5 @@ func runConsistency(peers *cluster.Peers, root string, mode string, token string
 		}
 	default: // report only
 	}
+	return inconsistent
 }

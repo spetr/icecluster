@@ -47,3 +47,16 @@ func TestReleaseByHolder(t *testing.T) {
 		t.Fatalf("/c should remain held")
 	}
 }
+
+func TestLoad(t *testing.T) {
+	m := NewManager()
+	_ = m.TryLock("/old", "n1")
+	list := []Info{{Path: "/new", Holder: "n2"}}
+	m.Load(list)
+	if _, ok := m.Holder("/old"); ok {
+		t.Fatalf("old lock should be cleared")
+	}
+	if h, ok := m.Holder("/new"); !ok || h != "n2" {
+		t.Fatalf("new lock missing or wrong holder: %v %v", h, ok)
+	}
+}

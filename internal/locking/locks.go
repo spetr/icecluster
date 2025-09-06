@@ -8,7 +8,7 @@ import (
 )
 
 type Manager struct {
-	mu    sync.Mutex
+	mu    sync.RWMutex
 	locks map[string]entry // path -> entry
 }
 
@@ -25,30 +25,29 @@ type entry struct {
 
 func (m *Manager) TryLock(path, holder string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if e, ok := m.locks[path]; ok && e.holder != holder {
+		m.mu.Unlock()
 		return ErrLocked
 	}
 	if _, ok := m.locks[path]; !ok {
 		m.locks[path] = entry{holder: holder, since: time.Now()}
-	} else {
-		// already held by same holder; keep original since
 	}
+	m.mu.Unlock()
 	return nil
 }
 
 func (m *Manager) Unlock(path, holder string) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if e, ok := m.locks[path]; ok && e.holder == holder {
 		delete(m.locks, path)
 	}
+	m.mu.Unlock()
 }
 
 func (m *Manager) Holder(path string) (string, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
 	e, ok := m.locks[path]
+	m.mu.RUnlock()
 	if !ok {
 		return "", false
 	}
@@ -63,14 +62,28 @@ type Info struct {
 
 // List returns all current locks.
 func (m *Manager) List() []Info {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
 	out := make([]Info, 0, len(m.locks))
 	for p, e := range m.locks {
 		out = append(out, Info{Path: p, Holder: e.holder, Since: e.since})
 	}
+	m.mu.RUnlock()
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 	return out
+}
+
+// Load replaces current lock state with the provided list.
+// Existing locks are discarded.
+func (m *Manager) Load(list []Info) {
+	m.mu.Lock()
+	m.locks = make(map[string]entry, len(list))
+	for _, it := range list {
+		if it.Path == "" || it.Holder == "" {
+			continue
+		}
+		m.locks[it.Path] = entry{holder: it.Holder, since: it.Since}
+	}
+	m.mu.Unlock()
 }
 
 // ReleaseByHolder releases all locks held by the specified holder.
@@ -80,7 +93,6 @@ func (m *Manager) ReleaseByHolder(holder string) int {
 		return 0
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	n := 0
 	for p, e := range m.locks {
 		if e.holder == holder {
@@ -88,5 +100,6 @@ func (m *Manager) ReleaseByHolder(holder string) int {
 			n++
 		}
 	}
+	m.mu.Unlock()
 	return n
 }

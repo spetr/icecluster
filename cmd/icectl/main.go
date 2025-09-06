@@ -21,6 +21,16 @@ type Cmd struct {
 	Base string
 }
 
+// doRequest creates and executes an HTTP request using the provided client.
+// The caller is responsible for closing the returned response body.
+func doRequest(client *http.Client, method, url string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	return client.Do(req)
+}
+
 func main() {
 	base := flag.String("base", "http://localhost:9000", "base URL of a node (http://host:port)")
 	to := flag.Duration("timeout", 10*time.Second, "HTTP timeout")
@@ -60,6 +70,7 @@ func main() {
 	case "health":
 		resp, err := client.Get(cmd.Base + "/health")
 		check(err)
+		defer resp.Body.Close()
 		fmt.Println(resp.Status)
 	case "get":
 		path := mustFlag("-path")
@@ -73,33 +84,45 @@ func main() {
 		io.Copy(os.Stdout, resp.Body)
 	case "put":
 		path := mustFlag("-path")
-		_, err := http.NewRequest(http.MethodPut, cmd.Base+"/v1/file?path="+url.QueryEscape(path), nil)
-		_ = err
-		data, err := io.ReadAll(os.Stdin)
+		resp, err := doRequest(client, http.MethodPut, cmd.Base+"/v1/file?path="+url.QueryEscape(path), os.Stdin)
 		check(err)
-		req, _ := http.NewRequest(http.MethodPut, cmd.Base+"/v1/file?path="+url.QueryEscape(path), bytes.NewReader(data))
-		resp, err := client.Do(req)
-		check(err)
+		defer resp.Body.Close()
+		if resp.StatusCode/100 != 2 {
+			fmt.Fprintf(os.Stderr, "error: %s\n", resp.Status)
+			os.Exit(1)
+		}
 		fmt.Println(resp.Status)
 	case "del":
 		path := mustFlag("-path")
-		req, _ := http.NewRequest(http.MethodDelete, cmd.Base+"/v1/file?path="+url.QueryEscape(path), nil)
-		resp, err := client.Do(req)
+		resp, err := doRequest(client, http.MethodDelete, cmd.Base+"/v1/file?path="+url.QueryEscape(path), nil)
 		check(err)
+		defer resp.Body.Close()
+		if resp.StatusCode/100 != 2 {
+			fmt.Fprintf(os.Stderr, "error: %s\n", resp.Status)
+			os.Exit(1)
+		}
 		fmt.Println(resp.Status)
 	case "lock":
 		path := mustFlag("-path")
 		holder := mustFlag("-holder")
-		req, _ := http.NewRequest(http.MethodPost, cmd.Base+"/v1/lock?path="+url.QueryEscape(path)+"&holder="+url.QueryEscape(holder), nil)
-		resp, err := client.Do(req)
+		resp, err := doRequest(client, http.MethodPost, cmd.Base+"/v1/lock?path="+url.QueryEscape(path)+"&holder="+url.QueryEscape(holder), nil)
 		check(err)
+		defer resp.Body.Close()
+		if resp.StatusCode/100 != 2 {
+			fmt.Fprintf(os.Stderr, "error: %s\n", resp.Status)
+			os.Exit(1)
+		}
 		fmt.Println(resp.Status)
 	case "unlock":
 		path := mustFlag("-path")
 		holder := mustFlag("-holder")
-		req, _ := http.NewRequest(http.MethodPost, cmd.Base+"/v1/unlock?path="+url.QueryEscape(path)+"&holder="+url.QueryEscape(holder), nil)
-		resp, err := client.Do(req)
+		resp, err := doRequest(client, http.MethodPost, cmd.Base+"/v1/unlock?path="+url.QueryEscape(path)+"&holder="+url.QueryEscape(holder), nil)
 		check(err)
+		defer resp.Body.Close()
+		if resp.StatusCode/100 != 2 {
+			fmt.Fprintf(os.Stderr, "error: %s\n", resp.Status)
+			os.Exit(1)
+		}
 		fmt.Println(resp.Status)
 	case "locks":
 		resp, err := client.Get(cmd.Base + "/v1/locks")
@@ -131,11 +154,8 @@ func main() {
 	case "stats":
 		showStats(client, cmd.Base)
 		if *resetStats {
-			req, _ := http.NewRequest(http.MethodPost, cmd.Base+"/v1/stats/reset", nil)
-			if resp, err := client.Do(req); err == nil {
-				if resp != nil && resp.Body != nil {
-					resp.Body.Close()
-				}
+			if resp, err := doRequest(client, http.MethodPost, cmd.Base+"/v1/stats/reset", nil); err == nil {
+				resp.Body.Close()
 			}
 		}
 	default:
@@ -345,11 +365,8 @@ func runRepair(client *http.Client, base, mode, source string) {
 					}
 					if _, ok := perPeer[tgt][path]; ok {
 						// delete
-						req, _ := http.NewRequest(http.MethodDelete, strings.TrimRight(tgt, "/")+"/v1/file?path="+url.QueryEscape(path), nil)
-						if resp, err := client.Do(req); err == nil {
-							if resp != nil && resp.Body != nil {
-								resp.Body.Close()
-							}
+						if resp, err := doRequest(client, http.MethodDelete, strings.TrimRight(tgt, "/")+"/v1/file?path="+url.QueryEscape(path), nil); err == nil {
+							resp.Body.Close()
 						}
 					}
 				}
@@ -396,11 +413,8 @@ func runRepair(client *http.Client, base, mode, source string) {
 			if ok && eTgt.MTime == eSrc.MTime && eTgt.Size == eSrc.Size {
 				continue
 			}
-			req, _ := http.NewRequest(http.MethodPut, strings.TrimRight(tgt, "/")+"/v1/file?path="+url.QueryEscape(path), bytes.NewReader(data))
-			if resp2, err := client.Do(req); err == nil {
-				if resp2 != nil && resp2.Body != nil {
-					resp2.Body.Close()
-				}
+			if resp2, err := doRequest(client, http.MethodPut, strings.TrimRight(tgt, "/")+"/v1/file?path="+url.QueryEscape(path), bytes.NewReader(data)); err == nil {
+				resp2.Body.Close()
 			} else {
 				fmt.Fprintf(os.Stderr, "push %s -> %s failed: %v\n", path, tgt, err)
 			}

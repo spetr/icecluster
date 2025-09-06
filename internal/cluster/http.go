@@ -311,6 +311,9 @@ func (h *HTTPServer) handleLock(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	log.Printf("lock: grant path=%s holder=%s in %s", path, holder, time.Since(t0))
+	if r.URL.Query().Get("nobroadcast") != "1" && h.Peers != nil && h.Peers.Coordinator() == h.Peers.Self() {
+		h.broadcastLock("lock", path, holder)
+	}
 	if h.Hooks != nil {
 		h.Hooks.Fire(r.Context(), "lock_grant", map[string]any{"path": path, "holder": holder})
 	}
@@ -337,6 +340,9 @@ func (h *HTTPServer) handleUnlock(w http.ResponseWriter, r *http.Request) {
 	}
 	h.Locker.Unlock(filepath.Clean(path), holder)
 	log.Printf("unlock: path=%s holder=%s in %s", path, holder, time.Since(t0))
+	if r.URL.Query().Get("nobroadcast") != "1" && h.Peers != nil && h.Peers.Coordinator() == h.Peers.Self() {
+		h.broadcastLock("unlock", path, holder)
+	}
 	if h.Hooks != nil {
 		h.Hooks.Fire(r.Context(), "lock_release", map[string]any{"path": path, "holder": holder})
 	}
@@ -349,6 +355,22 @@ func (h *HTTPServer) handleLocks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	JSON(w, 200, h.Locker.List())
+}
+
+func (h *HTTPServer) broadcastLock(op, path, holder string) {
+	if h.Peers == nil {
+		return
+	}
+	for _, peer := range h.Peers.List() {
+		if peer == h.Peers.Self() {
+			continue
+		}
+		req, _ := http.NewRequest(http.MethodPost, peer+"/v1/"+op+"?path="+url.QueryEscape(path)+"&holder="+url.QueryEscape(holder)+"&nobroadcast=1", nil)
+		if h.Token != "" {
+			req.Header.Set("Authorization", "Bearer "+h.Token)
+		}
+		_, _ = (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	}
 }
 
 // handleStats returns per-peer operation statistics.
